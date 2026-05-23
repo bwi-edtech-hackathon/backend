@@ -1,7 +1,7 @@
 """Password hashing and JWT issuance/verification."""
 
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 import bcrypt
@@ -43,7 +43,7 @@ def issue_token(
     extra_claims: dict[str, Any] | None = None,
 ) -> str:
     """Issue a signed JWT. Subject is the user's UUID as string."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     payload: dict[str, Any] = {
         "sub": str(subject),
         "iat": int(now.timestamp()),

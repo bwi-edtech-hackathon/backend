@@ -1,6 +1,6 @@
 """Timezone-aware time helpers (Tashkent for business logic, UTC for storage)."""
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytz
 
@@ -10,7 +10,7 @@ TASHKENT_TZ = pytz.timezone(settings.app_timezone)
 
 
 def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def tashkent_now() -> datetime:
@@ -19,5 +19,5 @@ def tashkent_now() -> datetime:
 
 def to_tashkent(dt: datetime) -> datetime:
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.replace(tzinfo=UTC)
     return dt.astimezone(TASHKENT_TZ)

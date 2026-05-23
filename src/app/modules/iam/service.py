@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import jwt
 from sqlalchemy import select
@@ -89,7 +89,7 @@ async def rotate_refresh(db: AsyncSession, refresh_token: str) -> dict:
         RefreshTokenBlacklist(
             jti=jti,
             user_id=user_id,
-            expires_at=datetime.fromtimestamp(payload["exp"], tz=timezone.utc),
+            expires_at=datetime.fromtimestamp(payload["exp"], tz=UTC),
             reason="rotated",
         )
     )
