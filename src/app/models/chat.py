@@ -88,4 +88,9 @@ class ChatMessage(Base, TimestampMixin):
     parts: Mapped[list] = mapped_column(JSONB, default=list, nullable=False)
     token_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
+    # UUIDs (as strings) of `formulas` rows that Gemini cited while producing
+    # this coach turn — extracted from a trailing `[[FORMULAS_USED:...]]` tag
+    # in the model's reply. Always [] for user/system messages.
+    formula_ids: Mapped[list] = mapped_column(JSONB, default=list, nullable=False)
+
     session: Mapped[ChatSession] = relationship(back_populates="messages")

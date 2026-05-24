@@ -41,6 +41,7 @@ from app.sse.chat_lesson import (
     _parse_structured,
     _save_message,
     _stub_stream,
+    extract_formula_ids,
 )
 
 router = APIRouter()
@@ -86,7 +87,7 @@ async def chat_lesson_ws(
         return
 
     try:
-        sess, subject, topic, history, weak_topics = await _load_context(
+        sess, subject, topic, history, weak_topics, formulas = await _load_context(
             session_id_or_slug, user_id
         )
     except Exception as e:  # noqa: BLE001
@@ -106,6 +107,7 @@ async def chat_lesson_ws(
         topic=topic,
         mastery_pct=float(sess.mastery_estimate),
         weak_topics=weak_topics,
+        formulas=formulas,
     )
 
     try:
@@ -177,11 +179,12 @@ async def chat_lesson_ws(
                 buffer = remainder
             else:
                 # Flush the longest prefix that can't possibly start a math/
-                # diagram block, so the user sees plain text appear immediately
-                # instead of waiting for the whole reply.
+                # diagram block (or the trailing `[[FORMULAS_USED:...]]` tag),
+                # so the user sees plain text appear immediately instead of
+                # waiting for the whole reply.
                 safe_idx = len(buffer)
                 for i, ch in enumerate(buffer):
-                    if ch in "$`":
+                    if ch in "$`[":
                         safe_idx = i
                         break
                 if safe_idx > 0:
@@ -191,10 +194,19 @@ async def chat_lesson_ws(
                     await _send_event(websocket, "token", {"content": text})
                     buffer = buffer[safe_idx:]
 
+        # Strip Gemini's citation tag (if any) from both the held buffer and
+        # the accumulated full text before the final flush/persist.
+        buffer, tail_ids = extract_formula_ids(buffer)
+        full_text, full_ids = extract_formula_ids(full_text)
+        cited_ids = tail_ids or full_ids
+
         if buffer.strip():
             emitted_parts.append({"type": "token", "content": buffer})
             token_count += len(buffer.split())
             await _send_event(websocket, "token", {"content": buffer})
+
+        if cited_ids:
+            await _send_event(websocket, "formulas_used", {"ids": cited_ids})
 
         msg_id = await _save_message(
             sess.id,
@@ -202,6 +214,7 @@ async def chat_lesson_ws(
             full_text,
             emitted_parts,
             token_count,
+            formula_ids=cited_ids,
         )
 
         await _send_event(

@@ -36,6 +36,7 @@ class MilestoneOut(BaseModel):
     mastery_pct: float
     est_minutes: int
     week_bucket: int
+    lane: int = 0
     weight: float
 
 

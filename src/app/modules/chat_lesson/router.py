@@ -245,6 +245,7 @@ class _ChatSessionSummary(_CamelModel):
     preview: str
     when: str
     status: str    # "active" | "mastered" | "struggling" | "in_progress"
+    subject: str | None = None    # SubjectCode string (e.g. "MATH", "HIST")
 
 
 class _ChatMessageOut(_CamelModel):
@@ -340,6 +341,15 @@ async def fe_list_sessions(
             .limit(limit)
         )
     ).scalars().all()
+    subject_ids = {s.subject_id for s in rows if s.subject_id}
+    subjects = (
+        (
+            await db.execute(select(Subject).where(Subject.id.in_(subject_ids)))
+        ).scalars().all()
+        if subject_ids
+        else []
+    )
+    smap = {s.id: s for s in subjects}
     out: list[_ChatSessionSummary] = []
     for sess in rows:
         topic = None
@@ -357,6 +367,7 @@ async def fe_list_sessions(
             )
         ).scalar_one_or_none()
         preview = (last_msg.content[:60] + "…") if last_msg and len(last_msg.content) > 60 else (last_msg.content if last_msg else "Just started")
+        subj = smap.get(sess.subject_id)
         out.append(
             _ChatSessionSummary(
                 id=str(sess.id),
@@ -364,6 +375,7 @@ async def fe_list_sessions(
                 preview=preview,
                 when=_ago(sess.started_at),
                 status=_status_label(sess),
+                subject=subj.code.value if subj else None,
             )
         )
     return out
@@ -594,6 +606,7 @@ async def fe_create_session_from_exam(
         preview=opener_lines[0],
         when="Now",
         status="active",
+        subject=subject.code.value,
     )
 
 
@@ -605,7 +618,7 @@ async def fe_create_session_from_exam(
 async def fe_create_session(
     payload: _CreateChatIn, user: CurrentUser, db: DbSession
 ) -> _ChatSessionSummary:
-    topic_name = (payload.topic or "Quadratic equations").strip() or "General"
+    topic_name = (payload.topic or "New Chat").strip() or "New Chat"
     subject_code = payload.subject or "MATH"
     topic = await _ensure_topic_for_user(db, topic_name, subject_code)
     mastery = (
@@ -630,12 +643,16 @@ async def fe_create_session(
     db.add(sess)
     await db.commit()
     await db.refresh(sess)
+    subj_row = (
+        await db.execute(select(Subject).where(Subject.id == topic.subject_id))
+    ).scalar_one_or_none()
     return _ChatSessionSummary(
         id=str(sess.id),
         topic=topic.name_en,
         preview="Just started",
         when="Now",
         status="active",
+        subject=subj_row.code.value if subj_row else None,
     )
 
 
@@ -655,12 +672,16 @@ async def fe_end_session(
     topic = (
         await db.execute(select(Topic).where(Topic.id == sess.topic_id))
     ).scalar_one_or_none() if sess.topic_id else None
+    subj_row = (
+        await db.execute(select(Subject).where(Subject.id == sess.subject_id))
+    ).scalar_one_or_none() if sess.subject_id else None
     return _ChatSessionSummary(
         id=str(sess.id),
         topic=topic.name_en if topic else "General",
         preview="Session ended",
         when=_ago(sess.started_at),
         status=_status_label(sess),
+        subject=subj_row.code.value if subj_row else None,
     )
 
 

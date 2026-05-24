@@ -476,7 +476,9 @@ class StartSessionIn(BaseModel):
     subject_id: uuid.UUID | None = None
     mode: str = "ai"           # "ranked" | "ai" | "friend"
     bot_tier: str = "SILVER"
-    opponent_id: uuid.UUID | None = None
+    # Accept either a real UUID (human friend) or a synthetic AI id like
+    # "ai-silver" — the AI flow uses bot_tier, so we don't parse this here.
+    opponent_id: str | None = None
     opponent_name: str | None = None
 
 

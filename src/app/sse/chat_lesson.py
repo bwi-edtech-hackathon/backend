@@ -34,6 +34,7 @@ from app.core.db import get_db
 from app.core.deps import CurrentUserId
 from app.models.catalog import Subject, Topic
 from app.models.chat import ChatMessage, ChatMessageRole, ChatSession, ChatSessionStatus
+from app.models.formula import Formula, FormulaKind
 from app.models.progress import MasteryTopic
 
 router = APIRouter(prefix="/api/v1/chat-lesson", tags=["chat-lesson-stream"])
@@ -57,6 +58,16 @@ the student's mastery, and useful reference formulas BEFORE the actual
 conversation history. Treat them as background — do not quote them back at the
 student. Reply to the latest student message only.
 
+FORMULA CITATION (REQUIRED):
+The "reference formulas" context message lists rows like
+    [F-<uuid>] Name — expression
+When your reply uses or relies on any of those formulas (even implicitly, e.g.
+the student plugs values into one), end your reply with a SINGLE final line:
+    [[FORMULAS_USED: F-<uuid>, F-<uuid>]]
+Use the EXACT [[FORMULAS_USED: …]] format — no surrounding text, no quotes. If
+your reply used none of the listed formulas, omit the tag entirely. Never
+invent IDs — only cite IDs that appeared in the context message.
+
 NEVER:
 - Give the answer directly
 - Praise without verifying understanding
@@ -65,54 +76,28 @@ NEVER:
 """
 
 
-# Per-topic reference snippets we expose to Gemini as separate context messages.
-# Keeping these tiny — only enough to remind the model of the canonical formulas.
-_TOPIC_HINTS: dict[str, str] = {
-    "quadratic": (
-        "Standard form: $ax^2 + bx + c = 0$. "
-        "Discriminant: $D = b^2 - 4ac$. "
-        "Quadratic formula: $x = (-b \\pm \\sqrt{D}) / 2a$. "
-        "Vieta's: $x_1 + x_2 = -b/a$, $x_1 x_2 = c/a$."
-    ),
-    "logarithm": (
-        "Product: $\\log_a(xy) = \\log_a x + \\log_a y$. "
-        "Quotient: $\\log_a(x/y) = \\log_a x - \\log_a y$. "
-        "Power: $\\log_a(x^n) = n \\log_a x$. "
-        "Change of base: $\\log_a x = \\ln x / \\ln a$."
-    ),
-    "trigonometry": (
-        "Pythagorean: $\\sin^2\\theta + \\cos^2\\theta = 1$. "
-        "Double-angle: $\\sin 2\\theta = 2\\sin\\theta\\cos\\theta$, "
-        "$\\cos 2\\theta = \\cos^2\\theta - \\sin^2\\theta$. "
-        "Law of cosines: $c^2 = a^2 + b^2 - 2ab\\cos\\gamma$."
-    ),
-    "linear": (
-        "General form: $ax + b = 0$, so $x = -b/a$ (with $a \\ne 0$). "
-        "For systems, prefer substitution or elimination over guessing."
-    ),
-    "inequality": (
-        "Flip the inequality when multiplying or dividing by a negative number. "
-        "For $|x| < k$: $-k < x < k$. For $|x| > k$: $x < -k$ or $x > k$."
-    ),
-    "sequence": (
-        "Arithmetic: $a_n = a_1 + (n-1)d$, $S_n = n/2 \\cdot (a_1 + a_n)$. "
-        "Geometric: $a_n = a_1 q^{n-1}$, $S_n = a_1 (q^n - 1)/(q - 1)$."
-    ),
-}
-
-
-def _topic_hint_for(topic_name: str) -> str | None:
-    if not topic_name:
-        return None
-    lc = topic_name.lower()
-    for key, hint in _TOPIC_HINTS.items():
-        if key in lc:
-            return hint
-    return None
-
 INLINE_MATH = re.compile(r"\$([^$]+?)\$")
 BLOCK_MATH = re.compile(r"\$\$([\s\S]+?)\$\$")
 MERMAID_BLOCK = re.compile(r"```mermaid\n([\s\S]+?)```")
+# The trailing tag Gemini emits to cite formulas it used. Captured *and
+# stripped* from the streamed text before saving / sending to the client.
+FORMULAS_USED_TAG = re.compile(
+    r"\[\[FORMULAS_USED:\s*([^\]]*)\]\]\s*$",
+    re.IGNORECASE,
+)
+_FORMULA_ID_RE = re.compile(r"F-([0-9a-f\-]{36})", re.IGNORECASE)
+
+
+def extract_formula_ids(text: str) -> tuple[str, list[str]]:
+    """Strip the trailing `[[FORMULAS_USED:...]]` tag from `text` and return
+    `(clean_text, [uuid_str, ...])`. If no tag is present, returns the input
+    unchanged and an empty list."""
+    m = FORMULAS_USED_TAG.search(text)
+    if not m:
+        return text, []
+    ids = _FORMULA_ID_RE.findall(m.group(1) or "")
+    clean = text[: m.start()].rstrip()
+    return clean, ids
 
 
 async def _load_context(session_id_or_slug: str, user_id: uuid.UUID):
@@ -167,8 +152,44 @@ async def _load_context(session_id_or_slug: str, user_id: uuid.UUID):
             if t:
                 weak_topic_names.append(f"{t.name_en} ({float(row.mastery_pct):.0f}%)")
 
-        return sess, subject, topic, list(history), weak_topic_names
+        formulas = await _load_formulas(db, sess.subject_id, topic)
+        return sess, subject, topic, list(history), weak_topic_names, formulas
     raise HTTPException(status_code=500, detail="DB unavailable")
+
+
+async def _load_formulas(db, subject_id: uuid.UUID, topic: Topic | None) -> list[Formula]:
+    """Pull the formula candidates Gemini may cite for this session.
+
+    Strategy: every FORMULA-kind row for the subject is fair game (the right
+    rail surfaces them all too), with topic-linked / keyword-matching rows
+    prioritized first so the most relevant rows aren't dropped if we ever
+    have to truncate. Reference-kind rows (humanities link lists) are
+    excluded — they're not citation candidates in chat."""
+    rows = (
+        await db.execute(
+            select(Formula)
+            .where(
+                Formula.subject_id == subject_id,
+                Formula.kind == FormulaKind.FORMULA,
+            )
+            .order_by(Formula.group_title, Formula.order_index)
+        )
+    ).scalars().all()
+    if not topic:
+        return list(rows)
+    topic_name_lc = (topic.name_en or "").lower()
+
+    def _is_relevant(f: Formula) -> bool:
+        if f.topic_id == topic.id:
+            return True
+        for kw in f.keywords or []:
+            if isinstance(kw, str) and kw.lower() in topic_name_lc:
+                return True
+        return False
+
+    relevant = [f for f in rows if _is_relevant(f)]
+    rest = [f for f in rows if f not in relevant]
+    return relevant + rest
 
 
 def _build_context_turns(
@@ -176,6 +197,7 @@ def _build_context_turns(
     topic: Topic | None,
     mastery_pct: float,
     weak_topics: list[str],
+    formulas: list[Formula] | None = None,
 ) -> list[dict]:
     """Split situational context into discrete user→model turns prepended to the
     Gemini chat history. Each turn covers ONE aspect (subject, topic, mastery,
@@ -225,12 +247,22 @@ def _build_context_turns(
             ),
         )
 
-    # 4. Reference formulas (only if we have a hint for this topic).
-    hint = _topic_hint_for(topic_label)
-    if hint:
+    # 4. Reference formulas pulled from the DB. Each row carries a stable
+    # `F-<uuid>` ID; cite the IDs of the formulas the model actually uses via
+    # the trailing [[FORMULAS_USED:…]] tag (see SYSTEM_PROMPT).
+    if formulas:
+        lines = ["Reference formulas for this session (cite the ones you use):"]
+        for f in formulas:
+            display = f.latex if f.latex else f.expression
+            lines.append(f"  [F-{f.id}] {f.name} — {display}")
+        lines.append(
+            "After your reply, list the IDs you relied on with:\n"
+            "    [[FORMULAS_USED: F-<uuid>, F-<uuid>]]\n"
+            "Omit the tag if you used none. Do not invent IDs."
+        )
         _pair(
             "What canonical formulas or facts should I keep handy for this topic?",
-            hint,
+            "\n".join(lines),
         )
 
     return turns
@@ -242,6 +274,7 @@ async def _save_message(
     content: str,
     parts: list,
     token_count: int,
+    formula_ids: list[str] | None = None,
 ) -> uuid.UUID:
     async for db in get_db():
         msg = ChatMessage(
@@ -250,6 +283,7 @@ async def _save_message(
             content=content,
             parts=parts,
             token_count=token_count,
+            formula_ids=list(formula_ids or []),
         )
         db.add(msg)
         await db.commit()
@@ -353,7 +387,7 @@ async def stream_message(
     if not content:
         raise HTTPException(status_code=400, detail="Empty message")
 
-    sess, subject, topic, history, weak_topics = await _load_context(
+    sess, subject, topic, history, weak_topics, formulas = await _load_context(
         session_id_or_slug, user_id
     )
 
@@ -370,6 +404,7 @@ async def stream_message(
         topic=topic,
         mastery_pct=float(sess.mastery_estimate),
         weak_topics=weak_topics,
+        formulas=formulas,
     )
 
     async def _generator() -> AsyncIterator[dict]:
@@ -397,10 +432,11 @@ async def stream_message(
                         yield {"event": evt, "data": json.dumps(data)}
                     buffer = remainder
                 else:
-                    # Flush any safe (non-dollar, non-backtick) prefix as tokens
+                    # Flush any safe (non-dollar, non-backtick, non-`[` so the
+                    # trailing `[[FORMULAS_USED:...]]` tag is held back) prefix.
                     safe_idx = len(buffer)
                     for i, ch in enumerate(buffer):
-                        if ch in "$`":
+                        if ch in "$`[":
                             safe_idx = i
                             break
                     if safe_idx > 0:
@@ -410,11 +446,22 @@ async def stream_message(
                         yield {"event": "token", "data": json.dumps({"content": text})}
                         buffer = buffer[safe_idx:]
 
-            # Flush remainder
+            # Strip the trailing citation tag (from both the buffered remainder
+            # and the accumulated full_text) before flushing the final token.
+            buffer, tail_ids = extract_formula_ids(buffer)
+            full_text, full_ids = extract_formula_ids(full_text)
+            cited_ids = tail_ids or full_ids
+
             if buffer.strip():
                 emitted_parts.append({"type": "token", "content": buffer})
                 token_count += len(buffer.split())
                 yield {"event": "token", "data": json.dumps({"content": buffer})}
+
+            if cited_ids:
+                yield {
+                    "event": "formulas_used",
+                    "data": json.dumps({"ids": cited_ids}),
+                }
 
             msg_id = await _save_message(
                 sess.id,
@@ -422,6 +469,7 @@ async def stream_message(
                 full_text,
                 emitted_parts,
                 token_count,
+                formula_ids=cited_ids,
             )
 
             yield {

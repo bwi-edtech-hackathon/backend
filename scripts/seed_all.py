@@ -18,21 +18,27 @@ sys.path.insert(0, str(ROOT))
 
 from scripts import seed_subjects, seed_users  # noqa: E402
 from scripts import seed_content  # noqa: E402
+from scripts import seed_formulas  # noqa: E402
 
 
 async def main() -> None:
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    print("Step 1/3 — subjects")
+    print("Step 1/4 — subjects")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     await seed_subjects.seed()
     print()
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    print("Step 2/3 — topics + questions (~95 per subject)")
+    print("Step 2/4 — topics + questions (~95 per subject)")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     await seed_content.seed()
     print()
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    print("Step 3/3 — schools, users, ELO, battles, leaderboard, progress")
+    print("Step 3/4 — reference formulas + humanities links")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    await seed_formulas.seed()
+    print()
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print("Step 4/4 — schools, users, ELO, battles, leaderboard, progress")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     await seed_users.seed()
     print("\n✓ All seeds applied.")

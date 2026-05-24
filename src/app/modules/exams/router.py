@@ -21,6 +21,7 @@ from app.core.deps import CurrentUser, DbSession
 from app.core.slugs import short_slug
 from app.models.catalog import Question, QuestionType, Subject, SubjectCode, Topic
 from app.models.exam import ExamAnswer, ExamAttempt, ExamKind, ExamStatus, Grade
+from app.models.formula import Formula, FormulaKind
 from app.models.progress import MasteryTopic
 from app.modules.exams.grader import estimate_rasch, grade_answer, grade_for_score
 
@@ -141,11 +142,18 @@ class ExamSummaryOut(_CamelModel):
 class FormulaItem(BaseModel):
     name: str
     eq: str
+    # Optional URL for humanities subjects where we surface curated references
+    # (history primary sources, atlases, literary texts) instead of formulas.
+    href: str | None = None
 
 
 class FormulaGroup(BaseModel):
     title: str
     items: list[FormulaItem]
+    # "formula" (default) renders LaTeX-style; "reference" renders as clickable
+    # external links so subjects like history/geography surface trusted sources
+    # rather than meaningless equations.
+    kind: str = "formula"
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -880,69 +888,57 @@ async def get_result(
     )
 
 
+
 # ════════════════════════════════════════════════════════════════════════════
 # Formula sheet + recent attempts
 # ════════════════════════════════════════════════════════════════════════════
 
-_MATH_FORMULAS: list[FormulaGroup] = [
-    FormulaGroup(
-        title="Algebra",
-        items=[
-            FormulaItem(name="Quadratic formula", eq="x = (−b ± √(b² − 4ac)) / 2a"),
-            FormulaItem(name="Discriminant", eq="D = b² − 4ac"),
-            FormulaItem(name="Vieta's theorem", eq="x₁ + x₂ = −b/a, x₁·x₂ = c/a"),
-            FormulaItem(name="Difference of squares", eq="a² − b² = (a − b)(a + b)"),
-            FormulaItem(name="Sum of cubes", eq="a³ + b³ = (a + b)(a² − ab + b²)"),
-            FormulaItem(name="Binomial square", eq="(a ± b)² = a² ± 2ab + b²"),
-        ],
-    ),
-    FormulaGroup(
-        title="Logarithms",
-        items=[
-            FormulaItem(name="Product", eq="logₐ(xy) = logₐ x + logₐ y"),
-            FormulaItem(name="Quotient", eq="logₐ(x/y) = logₐ x − logₐ y"),
-            FormulaItem(name="Power", eq="logₐ(xⁿ) = n·logₐ x"),
-            FormulaItem(name="Change of base", eq="logₐ x = ln x / ln a"),
-        ],
-    ),
-    FormulaGroup(
-        title="Trigonometry",
-        items=[
-            FormulaItem(name="Pythagorean identity", eq="sin²θ + cos²θ = 1"),
-            FormulaItem(name="Double angle (sin)", eq="sin 2θ = 2 sinθ cosθ"),
-            FormulaItem(name="Double angle (cos)", eq="cos 2θ = cos²θ − sin²θ"),
-            FormulaItem(name="Tangent", eq="tan θ = sin θ / cos θ"),
-            FormulaItem(name="Law of cosines", eq="c² = a² + b² − 2ab·cosγ"),
-        ],
-    ),
-    FormulaGroup(
-        title="Geometry",
-        items=[
-            FormulaItem(name="Circle area", eq="A = πr²"),
-            FormulaItem(name="Circle circumference", eq="C = 2πr"),
-            FormulaItem(name="Triangle area", eq="A = ½·b·h"),
-            FormulaItem(name="Sphere volume", eq="V = (4/3)πr³"),
-            FormulaItem(name="Cylinder volume", eq="V = πr²h"),
-        ],
-    ),
-    FormulaGroup(
-        title="Sequences & series",
-        items=[
-            FormulaItem(name="Arithmetic n-th term", eq="aₙ = a₁ + (n − 1)d"),
-            FormulaItem(name="Arithmetic sum", eq="Sₙ = n/2 · (a₁ + aₙ)"),
-            FormulaItem(name="Geometric n-th term", eq="aₙ = a₁ · qⁿ⁻¹"),
-            FormulaItem(name="Geometric sum", eq="Sₙ = a₁ · (qⁿ − 1) / (q − 1)"),
-        ],
-    ),
-]
+
+def _formula_to_item(f: Formula) -> FormulaItem:
+    return FormulaItem(name=f.name, eq=f.expression, href=f.href)
 
 
 @router.get("/formulas", response_model=list[FormulaGroup])
-async def formulas(subject: str = "MATH") -> list[FormulaGroup]:
-    """Formula sheet. Currently only Math — other subjects return [] for now."""
-    if subject.upper() == "MATH":
-        return _MATH_FORMULAS
-    return []
+async def formulas(db: DbSession, subject: str = "MATH") -> list[FormulaGroup]:
+    """Per-subject reference content, pulled from the seeded `formulas` table.
+
+    STEM subjects (MATH/PHYS/CHEM/BIO) return canonical formulas; humanities
+    (HIST/GEOG/literature) return curated external source links so the right
+    rail stays useful instead of showing irrelevant math equations. Group
+    titles and per-row ordering come from the same DB columns the chat coach
+    cites against, so both surfaces stay in sync."""
+    try:
+        code = SubjectCode(subject.upper())
+    except ValueError:
+        return []
+    subj = (
+        await db.execute(select(Subject).where(Subject.code == code))
+    ).scalar_one_or_none()
+    if not subj:
+        return []
+    rows = (
+        await db.execute(
+            select(Formula)
+            .where(Formula.subject_id == subj.id)
+            .order_by(Formula.kind, Formula.group_title, Formula.order_index)
+        )
+    ).scalars().all()
+    if not rows:
+        return []
+    # Preserve the first-seen order of group_title so the response matches the
+    # ordering implied by the seed (Algebra → Logarithms → Trigonometry … ).
+    groups: dict[str, dict] = {}
+    for f in rows:
+        slot = groups.setdefault(
+            f.group_title,
+            {
+                "title": f.group_title,
+                "kind": f.kind.value,
+                "items": [],
+            },
+        )
+        slot["items"].append(_formula_to_item(f))
+    return [FormulaGroup(**g) for g in groups.values()]
 
 
 # ════════════════════════════════════════════════════════════════════════════

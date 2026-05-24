@@ -57,6 +57,20 @@ async def pick_battle_questions(
             )
         ).scalars().all()
     if not rows:
+        # Last-ditch fallback: pull from ANY subject so a sparsely-seeded
+        # subject doesn't hang the matchmaking UI with a 503.
+        rows = (
+            await db.execute(
+                select(Question)
+                .where(Question.suitable_for_battle.is_(True))
+                .limit(count * 3)
+            )
+        ).scalars().all()
+    if not rows:
+        rows = (
+            await db.execute(select(Question).limit(count * 3))
+        ).scalars().all()
+    if not rows:
         return []
     rng = random.Random()
     sample = rng.sample(list(rows), min(count, len(rows)))
