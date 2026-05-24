@@ -30,6 +30,7 @@ class MilestoneOut(BaseModel):
     topic_id: uuid.UUID
     topic_slug: str
     topic_name_uz: str
+    topic_name_ru: str = ""  # default keeps roadmaps stored before ru was added renderable
     topic_name_en: str
     order: int
     status: str

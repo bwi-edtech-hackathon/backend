@@ -39,6 +39,7 @@ class SessionOut(BaseModel):
     subject_id: uuid.UUID
     topic_id: uuid.UUID | None
     topic_name_uz: str | None
+    topic_name_ru: str | None
     topic_name_en: str | None
     trigger: str
     status: str
@@ -99,6 +100,7 @@ async def _session_to_out(db, sess: ChatSession) -> SessionOut:
         subject_id=sess.subject_id,
         topic_id=sess.topic_id,
         topic_name_uz=topic.name_uz if topic else None,
+        topic_name_ru=topic.name_ru if topic else None,
         topic_name_en=topic.name_en if topic else None,
         trigger=sess.trigger.value,
         status=sess.status.value,

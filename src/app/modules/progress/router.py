@@ -24,6 +24,7 @@ class SubjectProgress(BaseModel):
     subject_code: str
     subject_slug: str
     subject_name_uz: str
+    subject_name_ru: str
     subject_name_en: str
     rasch_score: float
     elo: int
@@ -50,6 +51,7 @@ class MasteryTopicOut(BaseModel):
     topic_id: uuid.UUID
     topic_slug: str
     topic_name_uz: str
+    topic_name_ru: str
     topic_name_en: str
     depth: int
     parent_id: uuid.UUID | None
@@ -180,6 +182,7 @@ async def get_dashboard(user: CurrentUser, db: DbSession) -> DashboardOut:
                 subject_code=subj.code.value,
                 subject_slug=subj.slug,
                 subject_name_uz=subj.name_uz,
+                subject_name_ru=subj.name_ru,
                 subject_name_en=subj.name_en,
                 rasch_score=rasch,
                 elo=elo,
@@ -226,6 +229,7 @@ async def get_mastery(
             topic_id=t.id,
             topic_slug=t.slug,
             topic_name_uz=t.name_uz,
+            topic_name_ru=t.name_ru,
             topic_name_en=t.name_en,
             depth=t.depth,
             parent_id=t.parent_id,

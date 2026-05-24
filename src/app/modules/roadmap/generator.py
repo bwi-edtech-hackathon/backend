@@ -110,6 +110,7 @@ def generate_milestones(
                 "topic_id": str(topic.id),
                 "topic_slug": topic.slug,
                 "topic_name_uz": topic.name_uz,
+                "topic_name_ru": topic.name_ru,
                 "topic_name_en": topic.name_en,
                 "order": idx,
                 "status": status,
