@@ -15,8 +15,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python deps
-COPY pyproject.toml ./
+# Install Python deps. README.md is referenced by pyproject.toml's `readme` field
+# so it must be present at build time even though it's just metadata.
+COPY pyproject.toml README.md ./
 RUN pip install --upgrade pip && \
     pip install -e .
 

@@ -29,6 +29,7 @@ from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
 from sqlalchemy import select
 
 from app.core.db import get_db
+from app.core.deps import _ensure_demo_user
 from app.core.redis import get_redis
 from app.core.security import decode_token
 from app.models.battle import (
@@ -596,14 +597,25 @@ async def _ensure_driver(battle: Battle) -> None:
 async def battle_ws(
     websocket: WebSocket,
     battle_id_or_slug: str,
-    token: str = Query(...),
+    token: str | None = Query(default=None),
 ) -> None:
-    try:
-        payload = decode_token(token, expected_type="access")
-        user_id = uuid.UUID(payload["sub"])
-    except (jwt.InvalidTokenError, KeyError, ValueError):
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="invalid_token")
-        return
+    """Live duel channel. `token` is optional in demo mode — without it the
+    socket binds to the shared demo user (must also be `player_a_id` of the
+    battle, which create_session ensures)."""
+
+    user_id: uuid.UUID | None = None
+    if token:
+        try:
+            payload = decode_token(token, expected_type="access")
+            user_id = uuid.UUID(payload["sub"])
+        except (jwt.InvalidTokenError, KeyError, ValueError):
+            user_id = None
+    if user_id is None:
+        # Demo fallback — bind to the demo user.
+        async for db in get_db():
+            demo = await _ensure_demo_user(db)
+            user_id = demo.id
+            break
 
     battle = await _load_battle(battle_id_or_slug)
     if not battle:

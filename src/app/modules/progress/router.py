@@ -7,7 +7,7 @@ from datetime import date, timedelta
 
 from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 
 from app.core.deps import CurrentUser, DbSession
 from app.models.battle import EloRating
@@ -135,7 +135,7 @@ async def get_dashboard(user: CurrentUser, db: DbSession) -> DashboardOut:
                     func.coalesce(func.avg(MasteryTopic.mastery_pct), 0).label("avg"),
                     func.count(MasteryTopic.id).label("topics_touched"),
                     func.sum(
-                        func.case((MasteryTopic.mastery_pct >= 75, 1), else_=0)
+                        case((MasteryTopic.mastery_pct >= 75, 1), else_=0)
                     ).label("mastered"),
                 ).where(
                     MasteryTopic.user_id == user.id,

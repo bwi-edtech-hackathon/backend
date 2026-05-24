@@ -18,7 +18,7 @@ from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.db import Base
-from app.models.base import TimestampMixin
+from app.models.base import TimestampMixin, pg_enum
 
 
 class BattleMode(str, enum.Enum):
@@ -57,9 +57,9 @@ class Battle(Base, TimestampMixin):
     subject_id: Mapped[uuid.UUID] = mapped_column(
         PGUUID(as_uuid=True), ForeignKey("subjects.id", ondelete="RESTRICT"), nullable=False
     )
-    mode: Mapped[BattleMode] = mapped_column(Enum(BattleMode, name="battle_mode"), nullable=False)
+    mode: Mapped[BattleMode] = mapped_column(pg_enum(BattleMode, name="battle_mode"), nullable=False)
     status: Mapped[BattleStatus] = mapped_column(
-        Enum(BattleStatus, name="battle_status"), default=BattleStatus.WAITING, nullable=False
+        pg_enum(BattleStatus, name="battle_status"), default=BattleStatus.WAITING, nullable=False
     )
 
     # Player A is always the initiator. Player B can be NULL for vs-AI battles.

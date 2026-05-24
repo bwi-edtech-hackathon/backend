@@ -34,21 +34,28 @@ from app.core.db import get_db
 from app.core.deps import CurrentUserId
 from app.models.catalog import Subject, Topic
 from app.models.chat import ChatMessage, ChatMessageRole, ChatSession, ChatSessionStatus
+from app.models.progress import MasteryTopic
 
 router = APIRouter(prefix="/api/v1/chat-lesson", tags=["chat-lesson-stream"])
 
 
 SYSTEM_PROMPT = """You are a patient, knowledgeable Socratic tutor for Uzbekistan's
-Milliy Sertifikat exam preparation. Subject: {subject}. Topic: {topic}.
-Student's current mastery estimate: {mastery_pct}%. Student's language: {language}.
+Milliy Sertifikat exam preparation. Student's language: {language}.
 
 CRITICAL RULES:
 1. NEVER lecture. Always ask questions to lead the student to the answer.
 2. Take the smallest possible step. If the student is stuck, ask an easier question.
 3. Use the student's language ({language}). If they switch, follow them.
-4. Render math with LaTeX inside $...$ for inline, $$...$$ for blocks.
-5. After ~5 successful exchanges, propose a verification problem.
-6. End the session when the student demonstrates mastery.
+4. Render math cleanly: use LaTeX inside $...$ for inline math and $$...$$ for blocks.
+   Do not wrap plain variable names in $...$ unless you actually need math typesetting.
+5. Use short paragraphs. Avoid Markdown headings. Use **bold** sparingly for key terms.
+6. After ~5 successful exchanges, propose a verification problem.
+7. End the session when the student demonstrates mastery.
+
+You will receive separate context messages describing the subject, the topic,
+the student's mastery, and useful reference formulas BEFORE the actual
+conversation history. Treat them as background — do not quote them back at the
+student. Reply to the latest student message only.
 
 NEVER:
 - Give the answer directly
@@ -56,6 +63,52 @@ NEVER:
 - Switch topics mid-session
 - Solve their homework or practice questions verbatim
 """
+
+
+# Per-topic reference snippets we expose to Gemini as separate context messages.
+# Keeping these tiny — only enough to remind the model of the canonical formulas.
+_TOPIC_HINTS: dict[str, str] = {
+    "quadratic": (
+        "Standard form: $ax^2 + bx + c = 0$. "
+        "Discriminant: $D = b^2 - 4ac$. "
+        "Quadratic formula: $x = (-b \\pm \\sqrt{D}) / 2a$. "
+        "Vieta's: $x_1 + x_2 = -b/a$, $x_1 x_2 = c/a$."
+    ),
+    "logarithm": (
+        "Product: $\\log_a(xy) = \\log_a x + \\log_a y$. "
+        "Quotient: $\\log_a(x/y) = \\log_a x - \\log_a y$. "
+        "Power: $\\log_a(x^n) = n \\log_a x$. "
+        "Change of base: $\\log_a x = \\ln x / \\ln a$."
+    ),
+    "trigonometry": (
+        "Pythagorean: $\\sin^2\\theta + \\cos^2\\theta = 1$. "
+        "Double-angle: $\\sin 2\\theta = 2\\sin\\theta\\cos\\theta$, "
+        "$\\cos 2\\theta = \\cos^2\\theta - \\sin^2\\theta$. "
+        "Law of cosines: $c^2 = a^2 + b^2 - 2ab\\cos\\gamma$."
+    ),
+    "linear": (
+        "General form: $ax + b = 0$, so $x = -b/a$ (with $a \\ne 0$). "
+        "For systems, prefer substitution or elimination over guessing."
+    ),
+    "inequality": (
+        "Flip the inequality when multiplying or dividing by a negative number. "
+        "For $|x| < k$: $-k < x < k$. For $|x| > k$: $x < -k$ or $x > k$."
+    ),
+    "sequence": (
+        "Arithmetic: $a_n = a_1 + (n-1)d$, $S_n = n/2 \\cdot (a_1 + a_n)$. "
+        "Geometric: $a_n = a_1 q^{n-1}$, $S_n = a_1 (q^n - 1)/(q - 1)$."
+    ),
+}
+
+
+def _topic_hint_for(topic_name: str) -> str | None:
+    if not topic_name:
+        return None
+    lc = topic_name.lower()
+    for key, hint in _TOPIC_HINTS.items():
+        if key in lc:
+            return hint
+    return None
 
 INLINE_MATH = re.compile(r"\$([^$]+?)\$")
 BLOCK_MATH = re.compile(r"\$\$([\s\S]+?)\$\$")
@@ -92,8 +145,95 @@ async def _load_context(session_id_or_slug: str, user_id: uuid.UUID):
                 .order_by(ChatMessage.created_at)
             )
         ).scalars().all()
-        return sess, subject, topic, list(history)
+
+        # Three weakest topics within this subject — gives the tutor a sense of
+        # what neighbouring concepts the student is shaky on.
+        weak_rows = (
+            await db.execute(
+                select(MasteryTopic)
+                .where(
+                    MasteryTopic.user_id == user_id,
+                    MasteryTopic.subject_id == sess.subject_id,
+                )
+                .order_by(MasteryTopic.mastery_pct.asc())
+                .limit(3)
+            )
+        ).scalars().all()
+        weak_topic_names: list[str] = []
+        for row in weak_rows:
+            t = (
+                await db.execute(select(Topic).where(Topic.id == row.topic_id))
+            ).scalar_one_or_none()
+            if t:
+                weak_topic_names.append(f"{t.name_en} ({float(row.mastery_pct):.0f}%)")
+
+        return sess, subject, topic, list(history), weak_topic_names
     raise HTTPException(status_code=500, detail="DB unavailable")
+
+
+def _build_context_turns(
+    subject: Subject,
+    topic: Topic | None,
+    mastery_pct: float,
+    weak_topics: list[str],
+) -> list[dict]:
+    """Split situational context into discrete user→model turns prepended to the
+    Gemini chat history. Each turn covers ONE aspect (subject, topic, mastery,
+    formulas) so the model can attend to them independently."""
+    turns: list[dict] = []
+
+    def _pair(question: str, answer: str) -> None:
+        turns.append({"role": "user", "parts": [question]})
+        turns.append({"role": "model", "parts": [answer]})
+
+    # 1. Subject framing.
+    _pair(
+        "What exam and subject is this tutoring session for?",
+        (
+            f"This is for Uzbekistan's Milliy Sertifikat ({subject.name_en}). "
+            "Stay within this subject; do not drift into other subjects."
+        ),
+    )
+
+    # 2. Topic framing.
+    topic_label = topic.name_en if topic else "general review"
+    _pair(
+        "What specific topic is the student working on right now?",
+        (
+            f"The active topic is: {topic_label}. "
+            "All questions, examples, and hints should stay anchored to this topic."
+        ),
+    )
+
+    # 3. Mastery snapshot + weak neighbours.
+    if weak_topics:
+        weak_str = "; ".join(weak_topics)
+        _pair(
+            "How well does the student know this material so far?",
+            (
+                f"Current mastery estimate on this topic: {mastery_pct:.0f}%. "
+                f"Weakest related topics (with % mastery): {weak_str}. "
+                "Calibrate question difficulty to this level — do not assume mastery they have not shown."
+            ),
+        )
+    else:
+        _pair(
+            "How well does the student know this material so far?",
+            (
+                f"Current mastery estimate on this topic: {mastery_pct:.0f}%. "
+                "No prior performance data on neighbouring topics — start with a gentle diagnostic question."
+            ),
+        )
+
+    # 4. Reference formulas (only if we have a hint for this topic).
+    hint = _topic_hint_for(topic_label)
+    if hint:
+        _pair(
+            "What canonical formulas or facts should I keep handy for this topic?",
+            hint,
+        )
+
+    return turns
 
 
 async def _save_message(
@@ -157,9 +297,20 @@ def _parse_structured(buf: str) -> tuple[list[tuple[str, dict]], str]:
 
 
 async def _gemini_stream(
-    prompt: str, system: str, history: list[ChatMessage]
+    prompt: str,
+    system: str,
+    history: list[ChatMessage],
+    context_turns: list[dict],
 ) -> AsyncIterator[str]:
-    """Yield raw text chunks from Gemini."""
+    """Yield raw text chunks from Gemini.
+
+    The conversation sent to Gemini is composed of three slices in order:
+      1. `context_turns` — synthetic user→model pairs holding the situational
+         briefing (subject, topic, mastery, formulas). Each piece of context
+         lives in its own turn so the model can attend to them independently.
+      2. `history` — the real prior ChatMessages from this session.
+      3. `prompt` — the current student message (sent via send_message).
+    """
     import google.generativeai as genai  # type: ignore
 
     genai.configure(api_key=settings.gemini_api_key)
@@ -167,7 +318,7 @@ async def _gemini_stream(
         model_name=settings.gemini_model,
         system_instruction=system,
     )
-    chat_history = []
+    chat_history: list[dict] = list(context_turns)
     for m in history:
         role = "user" if m.role == ChatMessageRole.USER else "model"
         chat_history.append({"role": role, "parts": [m.content]})
@@ -202,7 +353,9 @@ async def stream_message(
     if not content:
         raise HTTPException(status_code=400, detail="Empty message")
 
-    sess, subject, topic, history = await _load_context(session_id_or_slug, user_id)
+    sess, subject, topic, history, weak_topics = await _load_context(
+        session_id_or_slug, user_id
+    )
 
     # Persist the user message immediately
     await _save_message(
@@ -210,10 +363,13 @@ async def stream_message(
     )
 
     system_prompt = SYSTEM_PROMPT.format(
-        subject=subject.name_en,
-        topic=topic.name_en if topic else "general",
-        mastery_pct=float(sess.mastery_estimate),
         language={"uz": "Uzbek", "ru": "Russian", "en": "English"}.get("en", "Uzbek"),
+    )
+    context_turns = _build_context_turns(
+        subject=subject,
+        topic=topic,
+        mastery_pct=float(sess.mastery_estimate),
+        weak_topics=weak_topics,
     )
 
     async def _generator() -> AsyncIterator[dict]:
@@ -224,7 +380,9 @@ async def stream_message(
 
         try:
             if settings.gemini_enabled:
-                text_iter = _gemini_stream(content, system_prompt, history)
+                text_iter = _gemini_stream(
+                    content, system_prompt, history, context_turns
+                )
             else:
                 text_iter = _stub_stream()
 

@@ -11,7 +11,7 @@ from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.db import Base
-from app.models.base import TimestampMixin
+from app.models.base import TimestampMixin, pg_enum
 
 
 class ChatTrigger(str, enum.Enum):
@@ -51,10 +51,10 @@ class ChatSession(Base, TimestampMixin):
     )
 
     trigger: Mapped[ChatTrigger] = mapped_column(
-        Enum(ChatTrigger, name="chat_trigger"), default=ChatTrigger.PROACTIVE, nullable=False
+        pg_enum(ChatTrigger, name="chat_trigger"), default=ChatTrigger.PROACTIVE, nullable=False
     )
     status: Mapped[ChatSessionStatus] = mapped_column(
-        Enum(ChatSessionStatus, name="chat_session_status"), default=ChatSessionStatus.ACTIVE, nullable=False
+        pg_enum(ChatSessionStatus, name="chat_session_status"), default=ChatSessionStatus.ACTIVE, nullable=False
     )
 
     # Mastery estimate at session start vs current — for progress bar in header
@@ -80,7 +80,7 @@ class ChatMessage(Base, TimestampMixin):
         PGUUID(as_uuid=True), ForeignKey("chat_sessions.id", ondelete="CASCADE"), nullable=False
     )
     role: Mapped[ChatMessageRole] = mapped_column(
-        Enum(ChatMessageRole, name="chat_message_role"), nullable=False
+        pg_enum(ChatMessageRole, name="chat_message_role"), nullable=False
     )
     content: Mapped[str] = mapped_column(Text, nullable=False)
 

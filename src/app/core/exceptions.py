@@ -1,11 +1,15 @@
 """Application-wide exception types and FastAPI handlers."""
 
+import logging
+import traceback
 from typing import Any
 
 from fastapi import FastAPI, Request, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import ORJSONResponse
+
+logger = logging.getLogger(__name__)
 
 
 class AppException(Exception):
@@ -92,6 +96,23 @@ def register_exception_handlers(app: FastAPI) -> None:
                     "code": "VALIDATION_ERROR",
                     "message": "Validation failed",
                     "details": {"errors": jsonable_encoder(exc.errors())},
+                }
+            },
+        )
+
+    # Catch-all so unhandled exceptions go through CORSMiddleware (otherwise
+    # Starlette's ErrorMiddleware sends a bare 500 without CORS headers, which
+    # browsers then surface as a misleading CORS error).
+    @app.exception_handler(Exception)
+    async def _unhandled_exc(req: Request, exc: Exception) -> ORJSONResponse:
+        logger.exception("Unhandled exception on %s %s", req.method, req.url.path)
+        return ORJSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "error": {
+                    "code": "INTERNAL_ERROR",
+                    "message": "Internal server error",
+                    "details": {"trace": traceback.format_exception_only(type(exc), exc)},
                 }
             },
         )

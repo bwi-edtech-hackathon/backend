@@ -9,7 +9,7 @@ from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.db import Base
-from app.models.base import TimestampMixin
+from app.models.base import TimestampMixin, pg_enum
 
 
 class UserLanguage(str, enum.Enum):
@@ -35,7 +35,7 @@ class User(Base, TimestampMixin):
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     full_name: Mapped[str] = mapped_column(String(120), nullable=False)
     language: Mapped[UserLanguage] = mapped_column(
-        Enum(UserLanguage, name="user_language"), default=UserLanguage.UZ, nullable=False
+        pg_enum(UserLanguage, name="user_language"), default=UserLanguage.UZ, nullable=False
     )
 
     # Region (vloyat) — free text per spec, no FK
@@ -53,7 +53,7 @@ class User(Base, TimestampMixin):
 
     # Plan
     plan: Mapped[Plan] = mapped_column(
-        Enum(Plan, name="user_plan"), default=Plan.FREE, nullable=False
+        pg_enum(Plan, name="user_plan"), default=Plan.FREE, nullable=False
     )
     premium_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 

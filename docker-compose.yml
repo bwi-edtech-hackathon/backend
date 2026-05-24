@@ -6,8 +6,10 @@ services:
       POSTGRES_USER: coachai
       POSTGRES_PASSWORD: coachai
       POSTGRES_DB: coachai
+    # Host port 5433 — your machine already runs a system Postgres on 5432.
+    # Containers inside the compose network still connect on 5432 (internal).
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -19,8 +21,9 @@ services:
   redis:
     image: redis:7-alpine
     container_name: coachai-redis
+    # Host port 6380 — another redis container already binds 6379.
     ports:
-      - "6379:6379"
+      - "6380:6379"
     volumes:
       - redis_data:/data
     healthcheck:

@@ -21,7 +21,7 @@ from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.db import Base
-from app.models.base import TimestampMixin
+from app.models.base import TimestampMixin, pg_enum
 
 
 class SubjectCode(str, enum.Enum):
@@ -119,7 +119,7 @@ class Question(Base, TimestampMixin):
     slug: Mapped[str] = mapped_column(String(80), unique=True, index=True, nullable=False)
 
     type: Mapped[QuestionType] = mapped_column(
-        Enum(QuestionType, name="question_type"), nullable=False
+        pg_enum(QuestionType, name="question_type"), nullable=False
     )
 
     # Body in 3 languages (Markdown + KaTeX)

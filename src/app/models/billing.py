@@ -9,7 +9,7 @@ from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.db import Base
-from app.models.base import TimestampMixin
+from app.models.base import TimestampMixin, pg_enum
 
 
 class PremiumSource(str, enum.Enum):
@@ -28,7 +28,7 @@ class PremiumGrant(Base, TimestampMixin):
         PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
     source: Mapped[PremiumSource] = mapped_column(
-        Enum(PremiumSource, name="premium_source"), nullable=False
+        pg_enum(PremiumSource, name="premium_source"), nullable=False
     )
     granted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

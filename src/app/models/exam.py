@@ -21,7 +21,7 @@ from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.db import Base
-from app.models.base import TimestampMixin
+from app.models.base import TimestampMixin, pg_enum
 
 
 class ExamKind(str, enum.Enum):
@@ -58,7 +58,7 @@ class ExamTemplate(Base, TimestampMixin):
         PGUUID(as_uuid=True), ForeignKey("subjects.id", ondelete="CASCADE"), nullable=False
     )
     slug: Mapped[str] = mapped_column(String(120), nullable=False)
-    kind: Mapped[ExamKind] = mapped_column(Enum(ExamKind, name="exam_kind"), nullable=False)
+    kind: Mapped[ExamKind] = mapped_column(pg_enum(ExamKind, name="exam_kind"), nullable=False)
 
     title_uz: Mapped[str] = mapped_column(String(160), nullable=False)
     title_ru: Mapped[str] = mapped_column(String(160), nullable=False)
@@ -92,9 +92,9 @@ class ExamAttempt(Base, TimestampMixin):
         PGUUID(as_uuid=True), ForeignKey("subjects.id", ondelete="RESTRICT"), nullable=False
     )
 
-    kind: Mapped[ExamKind] = mapped_column(Enum(ExamKind, name="exam_kind"), nullable=False)
+    kind: Mapped[ExamKind] = mapped_column(pg_enum(ExamKind, name="exam_kind"), nullable=False)
     status: Mapped[ExamStatus] = mapped_column(
-        Enum(ExamStatus, name="exam_status"), default=ExamStatus.IN_PROGRESS, nullable=False
+        pg_enum(ExamStatus, name="exam_status"), default=ExamStatus.IN_PROGRESS, nullable=False
     )
 
     # Frozen question list at start of exam: [{question_id, section, index, points}]
@@ -108,7 +108,7 @@ class ExamAttempt(Base, TimestampMixin):
     # Scoring
     raw_score: Mapped[Decimal | None] = mapped_column(Numeric(6, 2), nullable=True)
     rasch_score: Mapped[Decimal | None] = mapped_column(Numeric(6, 2), nullable=True)
-    grade: Mapped[Grade | None] = mapped_column(Enum(Grade, name="exam_grade"), nullable=True)
+    grade: Mapped[Grade | None] = mapped_column(pg_enum(Grade, name="exam_grade"), nullable=True)
 
     # Per-topic mastery snapshot at submit (JSON: {topic_id: pct})
     topic_breakdown: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)

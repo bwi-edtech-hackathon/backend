@@ -18,6 +18,7 @@ from app.core.redis import close_redis
 from app.modules.battle import router as battle_router
 from app.modules.billing import router as billing_router
 from app.modules.catalog import router as catalog_router
+from app.modules.chat_lesson import fe_router as chat_lesson_fe_router
 from app.modules.chat_lesson import router as chat_lesson_router
 from app.modules.exams import router as exams_router
 from app.modules.iam import router as iam_router
@@ -93,6 +94,7 @@ app.include_router(exams_router)
 app.include_router(progress_router)
 app.include_router(roadmap_router)
 app.include_router(chat_lesson_router)
+app.include_router(chat_lesson_fe_router)
 app.include_router(battle_router)
 app.include_router(leaderboards_router)
 app.include_router(billing_router)

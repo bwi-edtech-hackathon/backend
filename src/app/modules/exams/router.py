@@ -1,4 +1,10 @@
-"""Exams routes — diagnostic, full mock, checkpoint, attempts, submit, result."""
+"""Exam routes — frontend-shaped, demo-mode friendly.
+
+The frontend uses simple string subject codes ("MATH"), camelCase JSON, and
+expects an async-style submit/result flow. We keep the DB-backed core (ExamAttempt
+rows, ExamAnswer rows, real grading) but project it through camelCase schemas and
+accept either a subject code or a UUID.
+"""
 
 from __future__ import annotations
 
@@ -8,12 +14,12 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from fastapi import APIRouter, HTTPException, status
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import desc, select
 
 from app.core.deps import CurrentUser, DbSession
 from app.core.slugs import short_slug
-from app.models.catalog import Question, Subject, Topic
+from app.models.catalog import Question, QuestionType, Subject, SubjectCode, Topic
 from app.models.exam import ExamAnswer, ExamAttempt, ExamKind, ExamStatus, Grade
 from app.models.progress import MasteryTopic
 from app.modules.exams.grader import estimate_rasch, grade_answer, grade_for_score
@@ -21,94 +27,263 @@ from app.modules.exams.grader import estimate_rasch, grade_answer, grade_for_sco
 router = APIRouter(prefix="/api/v1", tags=["exams"])
 
 
-# === Schemas ===
-class StartDiagnosticIn(BaseModel):
-    subject_id: uuid.UUID
+# ════════════════════════════════════════════════════════════════════════════
+# Frontend-shaped schemas (camelCase via aliases)
+# ════════════════════════════════════════════════════════════════════════════
+
+_FRONTEND_CONFIG = ConfigDict(populate_by_name=True, from_attributes=True)
+
+
+class _CamelModel(BaseModel):
+    model_config = _FRONTEND_CONFIG
+
+
+class ExamQuestionOut(_CamelModel):
+    """Mirrors frontend `ExamQuestion` in lib/api.ts."""
+
+    id: str
+    index: int
+    section: str            # "A" | "B"
+    type: str               # "closed" | "open_a" | "open_b"
+    domain: str
+    topic: str
+    prompt: str
+    options: list[dict] | None = None
+    weight: float
+
+
+class ExamSessionOut(_CamelModel):
+    """Mirrors frontend `ExamSession` in lib/api.ts."""
+
+    id: str
+    slug: str
+    subject: str
+    started_at: int = Field(alias="startedAt")
+    duration_ms: int = Field(alias="durationMs")
+    questions: list[ExamQuestionOut]
+
+
+class StartExamIn(BaseModel):
+    """Body for `POST /api/exam/sessions`. Accepts subject code or UUID."""
+
+    subject: str | None = None
+    subject_id: uuid.UUID | None = None
+    kind: str = "full_mock"   # "diagnostic" | "full_mock" | "checkpoint"
     target_grade: str | None = None
 
 
-class StartFullMockIn(BaseModel):
-    subject_id: uuid.UUID
+class AnswerIn(_CamelModel):
+    """Frontend sends either `{qIndex, answer, flagged}` or
+    `{question_index, answer, time_taken_ms, flagged}`. We accept both."""
 
-
-class StartCheckpointIn(BaseModel):
-    topic_id: uuid.UUID
-
-
-class QuestionView(BaseModel):
-    id: uuid.UUID
-    index: int
-    type: str
-    body_uz: str
-    body_ru: str
-    body_en: str
-    options: dict | None
-    points: float
-    topic_id: uuid.UUID
-    flagged: bool = False
-    answered: bool = False
-
-
-class AttemptOut(BaseModel):
-    id: uuid.UUID
-    slug: str
-    kind: str
-    status: str
-    subject_id: uuid.UUID
-    started_at: datetime
-    expires_at: datetime | None
-    submitted_at: datetime | None
-    total_questions: int
-    answered_count: int
-    flagged_count: int
-    questions: list[QuestionView]
-
-
-class AnswerIn(BaseModel):
-    question_index: int
+    question_index: int = Field(alias="qIndex")
     answer: dict | list | str | None = None
-    time_taken_ms: int | None = None
     flagged: bool = False
+    time_taken_ms: int | None = Field(default=None, alias="timeMs")
 
 
-class AutosaveIn(BaseModel):
+class AutosaveIn(_CamelModel):
     answers: list[AnswerIn]
 
 
-class ResultOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-    attempt_id: uuid.UUID
-    slug: str
-    rasch_score: float
-    raw_score: float
+class SubmitOut(_CamelModel):
+    """Frontend expects `{ jobId }` — we make grading synchronous, but the
+    polling loop in ExamAnalyzing.tsx works either way."""
+
+    job_id: str = Field(alias="jobId")
+    session_id: str = Field(alias="sessionId")
+
+
+class TopicBreakdownOut(_CamelModel):
+    topic: str
+    domain: str
+    mastery: float
+    impact: float
+
+
+class StrongTopicOut(_CamelModel):
+    topic: str
+    domain: str
+    mastery: float
+
+
+class SectionStats(_CamelModel):
+    correct: int
+    total: int
+    ball: float
+
+
+class ExamBreakdownItem(_CamelModel):
+    q_index: int = Field(alias="qIndex")
+    topic: str
+    your_answer: str | None = Field(default=None, alias="yourAnswer")
+    correct_answer: str = Field(alias="correctAnswer")
+    correct: bool
+    time_spent_ms: int = Field(alias="timeSpentMs")
+
+
+class ExamSummaryOut(_CamelModel):
+    """Mirrors frontend `ExamSummary`."""
+
+    session_id: str = Field(alias="sessionId")
+    rasch_score: float = Field(alias="raschScore")
     grade: str
-    correct_count: int
-    total_questions: int
-    topic_breakdown: dict
-    weakest_topics: list[dict]
-    submitted_at: datetime
+    total_correct: int = Field(alias="totalCorrect")
+    total_questions: int = Field(alias="totalQuestions")
+    section_a: SectionStats = Field(alias="sectionA")
+    section_b: SectionStats = Field(alias="sectionB")
+    weak_topics: list[TopicBreakdownOut] = Field(alias="weakTopics")
+    strong_topics: list[StrongTopicOut] = Field(alias="strongTopics")
+    breakdown: list[ExamBreakdownItem]
+    certificate_ready: bool = Field(alias="certificateReady")
 
 
-# === Helpers ===
+class FormulaItem(BaseModel):
+    name: str
+    eq: str
+
+
+class FormulaGroup(BaseModel):
+    title: str
+    items: list[FormulaItem]
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Helpers
+# ════════════════════════════════════════════════════════════════════════════
+
 DEFAULT_DURATIONS = {
     ExamKind.DIAGNOSTIC: 30,
     ExamKind.FULL_MOCK: 150,
     ExamKind.CHECKPOINT: 15,
 }
 
+SECTION_A_TARGET = 35
+SECTION_B_TARGET = 10
+FULL_MOCK_TARGET = SECTION_A_TARGET + SECTION_B_TARGET
+
 
 def _now() -> datetime:
     return datetime.now(UTC)
 
 
-def _pick_questions_for_subject(
-    questions: list[Question], target_count: int
+def _ms(dt: datetime) -> int:
+    return int(dt.timestamp() * 1000)
+
+
+async def _resolve_subject(db, payload: StartExamIn) -> Subject:
+    if payload.subject_id:
+        subj = (
+            await db.execute(select(Subject).where(Subject.id == payload.subject_id))
+        ).scalar_one_or_none()
+    elif payload.subject:
+        try:
+            code = SubjectCode(payload.subject.upper())
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail="Unknown subject code") from e
+        subj = (
+            await db.execute(select(Subject).where(Subject.code == code))
+        ).scalar_one_or_none()
+    else:
+        raise HTTPException(status_code=400, detail="subject or subject_id required")
+    if not subj:
+        raise HTTPException(status_code=404, detail="Subject not found")
+    return subj
+
+
+async def _resolve_subject_by_code(db, subject_code: str) -> Subject:
+    """For GET endpoints that take subject as a string."""
+    try:
+        code = SubjectCode(subject_code.upper())
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail="Unknown subject code") from e
+    subj = (
+        await db.execute(select(Subject).where(Subject.code == code))
+    ).scalar_one_or_none()
+    if not subj:
+        raise HTTPException(status_code=404, detail="Subject not found")
+    return subj
+
+
+def _section_for_question(q: Question) -> str:
+    return "A" if q.type == QuestionType.CLOSED else "B"
+
+
+_DOMAIN_FROM_TOPIC_HINT = {
+    "algebra": "Algebra",
+    "geometry": "Geometry",
+    "trigonometry": "Trigonometry",
+    "functions": "Functions",
+    "probability": "Functions",
+    "sequences": "Sequences & series",
+    "logarithms": "Algebra",
+    "inequalities": "Algebra",
+    "kinematics": "Mechanics",
+    "newton": "Mechanics",
+    "momentum": "Mechanics",
+    "energy": "Mechanics",
+    "thermodynamics": "Thermodynamics",
+    "electro": "Electromagnetism",
+    "circuit": "Electromagnetism",
+    "optics": "Waves & optics",
+    "waves": "Waves & optics",
+    "atomic": "General chemistry",
+    "periodic": "General chemistry",
+    "bonding": "General chemistry",
+    "stoichiometry": "General chemistry",
+    "acid": "General chemistry",
+    "redox": "General chemistry",
+    "organic": "Organic chemistry",
+    "solutions": "General chemistry",
+    "gas laws": "General chemistry",
+    "cell": "Biology",
+    "genetics": "Biology",
+    "anatomy": "Biology",
+    "plants": "Biology",
+    "animals": "Biology",
+    "evolution": "Biology",
+    "ecology": "Biology",
+}
+
+
+def _domain_for(topic: Topic, fallback: str = "Algebra") -> str:
+    """Use the depth-1 ancestor (`Algebra`/`Geometry`/`Functions`) if present,
+    else derive from the topic's English name. Callers should pass the
+    subject's display name as `fallback` so unmapped topics get a subject-
+    appropriate label rather than always reading "Algebra"."""
+    if topic.parent_id:
+        # Best-effort: the topic name itself is descriptive enough for the UI.
+        pass
+    name_lc = (topic.name_en or "").lower()
+    for key, val in _DOMAIN_FROM_TOPIC_HINT.items():
+        if key in name_lc:
+            return val
+    return fallback
+
+
+def _question_options_view(q: Question) -> list[dict] | None:
+    if not q.options or q.type != QuestionType.CLOSED:
+        return None
+    out: list[dict] = []
+    for letter in ("A", "B", "C", "D"):
+        opt = q.options.get(letter)
+        if opt is None:
+            continue
+        if isinstance(opt, dict):
+            text = opt.get("en") or opt.get("uz") or opt.get("ru") or ""
+        else:
+            text = str(opt)
+        out.append({"letter": letter, "text": text})
+    return out or None
+
+
+def _pick_questions(
+    questions: list[Question], target_count: int, prefer_section: str | None = None
 ) -> list[Question]:
-    """Spread picks across topics + difficulty bands."""
+    """Round-robin sampler across topics with a deterministic seed."""
     if len(questions) <= target_count:
         return list(questions)
-    rng = random.Random(target_count)  # deterministic-ish per request
-    # Bucket by topic, then sample round-robin
+    rng = random.Random(target_count)
     by_topic: dict[uuid.UUID, list[Question]] = {}
     for q in questions:
         by_topic.setdefault(q.topic_id, []).append(q)
@@ -128,7 +303,117 @@ def _pick_questions_for_subject(
     return picks
 
 
-async def _load_attempt(db, attempt_id_or_slug: str, user_id: uuid.UUID) -> ExamAttempt:
+async def _select_full_mock_questions(db, subject_id: uuid.UUID) -> list[Question]:
+    """Pick 35 closed (Section A) + 10 open (Section B). Falls back to any if the
+    typed pool is too small."""
+    closed = (
+        await db.execute(
+            select(Question).where(
+                Question.subject_id == subject_id,
+                Question.type == QuestionType.CLOSED,
+            )
+        )
+    ).scalars().all()
+    open_q = (
+        await db.execute(
+            select(Question).where(
+                Question.subject_id == subject_id,
+                Question.type.in_([QuestionType.OPEN_A, QuestionType.OPEN_B]),
+            )
+        )
+    ).scalars().all()
+    a_picked = _pick_questions(list(closed), SECTION_A_TARGET)
+    b_picked = _pick_questions(list(open_q), SECTION_B_TARGET)
+    picks = a_picked + b_picked
+    if not picks:
+        # Last-resort: any question — better than 503'ing the demo.
+        any_q = (
+            await db.execute(
+                select(Question).where(Question.subject_id == subject_id)
+            )
+        ).scalars().all()
+        picks = _pick_questions(list(any_q), FULL_MOCK_TARGET)
+    return picks
+
+
+def _persist_layout(questions: list[Question]) -> list[dict]:
+    return [
+        {
+            "question_id": str(q.id),
+            "index": i,
+            "topic_id": str(q.topic_id),
+            "points": float(q.points),
+            "difficulty": float(q.difficulty),
+        }
+        for i, q in enumerate(questions)
+    ]
+
+
+async def _load_attempt_questions(
+    db, attempt: ExamAttempt
+) -> tuple[dict[uuid.UUID, Question], dict[uuid.UUID, Topic]]:
+    qids = [uuid.UUID(lay["question_id"]) for lay in attempt.question_layout]
+    questions = (
+        await db.execute(select(Question).where(Question.id.in_(qids)))
+    ).scalars().all()
+    qmap = {q.id: q for q in questions}
+    topic_ids = {q.topic_id for q in questions}
+    topics = (
+        await db.execute(select(Topic).where(Topic.id.in_(topic_ids)))
+    ).scalars().all()
+    tmap = {t.id: t for t in topics}
+    return qmap, tmap
+
+
+def _build_session_view(
+    attempt: ExamAttempt,
+    subject: Subject,
+    qmap: dict[uuid.UUID, Question],
+    tmap: dict[uuid.UUID, Topic],
+) -> ExamSessionOut:
+    qviews: list[ExamQuestionOut] = []
+    subject_label = subject.name_en
+    for layout in attempt.question_layout:
+        qid = uuid.UUID(layout["question_id"])
+        q = qmap.get(qid)
+        if not q:
+            continue
+        t = tmap.get(q.topic_id)
+        prompt = (q.body_en or q.body_uz or "").strip()
+        # The frontend renders `prompt` as the question stem. If the body
+        # contains a math expression on its own line, we still ship it as-is.
+        qviews.append(
+            ExamQuestionOut(
+                id=str(q.id),
+                index=layout["index"],
+                section=_section_for_question(q),
+                type=q.type.value,
+                domain=_domain_for(t, fallback=subject_label) if t else subject_label,
+                topic=t.name_en if t else "",
+                prompt=prompt,
+                options=_question_options_view(q),
+                weight=float(q.points),
+            )
+        )
+    qviews.sort(key=lambda v: v.index)
+
+    duration_ms = DEFAULT_DURATIONS[attempt.kind] * 60 * 1000
+    if attempt.expires_at and attempt.started_at:
+        duration_ms = int((attempt.expires_at - attempt.started_at).total_seconds() * 1000)
+
+    return ExamSessionOut(
+        id=str(attempt.id),
+        slug=attempt.slug,
+        subject=subject.code.value,
+        startedAt=_ms(attempt.started_at),
+        durationMs=duration_ms,
+        questions=qviews,
+    )
+
+
+async def _load_attempt_for_user(
+    db, attempt_id_or_slug: str, user_id: uuid.UUID
+) -> ExamAttempt:
     stmt = select(ExamAttempt)
     try:
         aid = uuid.UUID(attempt_id_or_slug)
@@ -137,67 +422,13 @@ async def _load_attempt(db, attempt_id_or_slug: str, user_id: uuid.UUID) -> Exam
         stmt = stmt.where(ExamAttempt.slug == attempt_id_or_slug)
     attempt = (await db.execute(stmt)).scalar_one_or_none()
     if not attempt or attempt.user_id != user_id:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Exam attempt not found"
-        )
+        raise HTTPException(status_code=404, detail="Exam attempt not found")
     return attempt
 
 
-def _build_question_views(
-    attempt: ExamAttempt, questions: dict[uuid.UUID, Question], answers: dict[int, ExamAnswer]
-) -> list[QuestionView]:
-    views: list[QuestionView] = []
-    for layout in attempt.question_layout:
-        qid = uuid.UUID(layout["question_id"])
-        idx = layout["index"]
-        q = questions.get(qid)
-        if not q:
-            continue
-        a = answers.get(idx)
-        views.append(
-            QuestionView(
-                id=q.id,
-                index=idx,
-                type=q.type.value,
-                body_uz=q.body_uz,
-                body_ru=q.body_ru,
-                body_en=q.body_en,
-                options=q.options,
-                points=float(q.points),
-                topic_id=q.topic_id,
-                flagged=bool(a and a.flagged),
-                answered=bool(a and a.answer is not None),
-            )
-        )
-    views.sort(key=lambda v: v.index)
-    return views
-
-
-async def _attempt_to_out(db, attempt: ExamAttempt) -> AttemptOut:
-    qids = [uuid.UUID(layout["question_id"]) for layout in attempt.question_layout]
-    questions = (
-        await db.execute(select(Question).where(Question.id.in_(qids)))
-    ).scalars().all()
-    qmap = {q.id: q for q in questions}
-    answers = (
-        await db.execute(select(ExamAnswer).where(ExamAnswer.attempt_id == attempt.id))
-    ).scalars().all()
-    amap = {a.question_index: a for a in answers}
-    views = _build_question_views(attempt, qmap, amap)
-    return AttemptOut(
-        id=attempt.id,
-        slug=attempt.slug,
-        kind=attempt.kind.value,
-        status=attempt.status.value,
-        subject_id=attempt.subject_id,
-        started_at=attempt.started_at,
-        expires_at=attempt.expires_at,
-        submitted_at=attempt.submitted_at,
-        total_questions=len(attempt.question_layout),
-        answered_count=sum(1 for a in answers if a.answer is not None),
-        flagged_count=sum(1 for a in answers if a.flagged),
-        questions=views,
-    )
+# ════════════════════════════════════════════════════════════════════════════
+# Start exam (frontend: POST /api/exam/sessions { subject })
+# ════════════════════════════════════════════════════════════════════════════
 
 
 async def _create_attempt(
@@ -210,27 +441,17 @@ async def _create_attempt(
 ) -> ExamAttempt:
     if not questions:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No questions available for this subject/topic",
+            status_code=503,
+            detail="No questions seeded for this subject — run scripts/seed_questions.py",
         )
     now = _now()
-    layout = [
-        {
-            "question_id": str(q.id),
-            "index": i,
-            "topic_id": str(q.topic_id),
-            "points": float(q.points),
-            "difficulty": float(q.difficulty),
-        }
-        for i, q in enumerate(questions)
-    ]
     attempt = ExamAttempt(
         slug=short_slug(f"{kind.value}-{title_hint}"),
         user_id=user_id,
         subject_id=subject_id,
         kind=kind,
         status=ExamStatus.IN_PROGRESS,
-        question_layout=layout,
+        question_layout=_persist_layout(questions),
         started_at=now,
         expires_at=now + timedelta(minutes=DEFAULT_DURATIONS[kind]),
     )
@@ -241,113 +462,82 @@ async def _create_attempt(
     return attempt
 
 
-# === Endpoints: start an exam ===
+async def _session_view(db, attempt: ExamAttempt) -> ExamSessionOut:
+    subject = (
+        await db.execute(select(Subject).where(Subject.id == attempt.subject_id))
+    ).scalar_one()
+    qmap, tmap = await _load_attempt_questions(db, attempt)
+    return _build_session_view(attempt, subject, qmap, tmap)
+
+
+def _parse_kind(s: str | None) -> ExamKind:
+    if not s:
+        return ExamKind.FULL_MOCK
+    s = s.lower().replace("-", "_")
+    try:
+        return ExamKind(s)
+    except ValueError:
+        return ExamKind.FULL_MOCK
+
+
 @router.post(
-    "/exams/diagnostic",
-    response_model=AttemptOut,
+    "/exam/sessions",
+    response_model=ExamSessionOut,
     status_code=status.HTTP_201_CREATED,
+    summary="Create a new exam session (frontend-shaped)",
 )
-async def start_diagnostic(
-    payload: StartDiagnosticIn, user: CurrentUser, db: DbSession
-) -> AttemptOut:
+async def create_session(
+    payload: StartExamIn, user: CurrentUser, db: DbSession
+) -> ExamSessionOut:
+    """Frontend's `createExamSession(subject)` lands here. Defaults to a 45-q
+    full mock for the named subject."""
+    subj = await _resolve_subject(db, payload)
+    kind = _parse_kind(payload.kind)
     if payload.target_grade and not user.target_grade:
         user.target_grade = payload.target_grade
-    subj = (
-        await db.execute(select(Subject).where(Subject.id == payload.subject_id))
-    ).scalar_one_or_none()
-    if not subj:
-        raise HTTPException(status_code=404, detail="Subject not found")
 
-    questions = (
-        await db.execute(
-            select(Question).where(Question.subject_id == subj.id).order_by(Question.difficulty)
-        )
-    ).scalars().all()
-    picked = _pick_questions_for_subject(list(questions), target_count=20)
-    attempt = await _create_attempt(
-        db, user.id, subj.id, ExamKind.DIAGNOSTIC, picked, subj.slug
-    )
-    return await _attempt_to_out(db, attempt)
+    if kind == ExamKind.FULL_MOCK:
+        picked = await _select_full_mock_questions(db, subj.id)
+    elif kind == ExamKind.DIAGNOSTIC:
+        questions = (
+            await db.execute(
+                select(Question).where(Question.subject_id == subj.id).order_by(Question.difficulty)
+            )
+        ).scalars().all()
+        picked = _pick_questions(list(questions), 20)
+    else:
+        # checkpoint without a topic — pick any 8 from subject
+        questions = (
+            await db.execute(select(Question).where(Question.subject_id == subj.id))
+        ).scalars().all()
+        picked = _pick_questions(list(questions), 8)
 
-
-@router.post(
-    "/exams/full-mock",
-    response_model=AttemptOut,
-    status_code=status.HTTP_201_CREATED,
-)
-async def start_full_mock(
-    payload: StartFullMockIn, user: CurrentUser, db: DbSession
-) -> AttemptOut:
-    subj = (
-        await db.execute(select(Subject).where(Subject.id == payload.subject_id))
-    ).scalar_one_or_none()
-    if not subj:
-        raise HTTPException(status_code=404, detail="Subject not found")
-    questions = (
-        await db.execute(select(Question).where(Question.subject_id == subj.id))
-    ).scalars().all()
-    picked = _pick_questions_for_subject(list(questions), target_count=45)
-    attempt = await _create_attempt(
-        db, user.id, subj.id, ExamKind.FULL_MOCK, picked, subj.slug
-    )
-    return await _attempt_to_out(db, attempt)
+    attempt = await _create_attempt(db, user.id, subj.id, kind, picked, subj.slug)
+    return await _session_view(db, attempt)
 
 
-@router.post(
-    "/exams/checkpoint",
-    response_model=AttemptOut,
-    status_code=status.HTTP_201_CREATED,
-)
-async def start_checkpoint(
-    payload: StartCheckpointIn, user: CurrentUser, db: DbSession
-) -> AttemptOut:
-    topic = (
-        await db.execute(select(Topic).where(Topic.id == payload.topic_id))
-    ).scalar_one_or_none()
-    if not topic:
-        raise HTTPException(status_code=404, detail="Topic not found")
-    questions = (
-        await db.execute(
-            select(Question).where(Question.topic_id == topic.id).limit(20)
-        )
-    ).scalars().all()
-    picked = _pick_questions_for_subject(list(questions), target_count=8)
-    attempt = await _create_attempt(
-        db, user.id, topic.subject_id, ExamKind.CHECKPOINT, picked, topic.slug
-    )
-    return await _attempt_to_out(db, attempt)
-
-
-# === Endpoints: during the exam ===
-@router.get("/exam-attempts/{attempt_id_or_slug}", response_model=AttemptOut)
-async def get_attempt(
+@router.get("/exam/sessions/{attempt_id_or_slug}", response_model=ExamSessionOut)
+async def get_session(
     attempt_id_or_slug: str, user: CurrentUser, db: DbSession
-) -> AttemptOut:
-    attempt = await _load_attempt(db, attempt_id_or_slug, user.id)
-    return await _attempt_to_out(db, attempt)
+) -> ExamSessionOut:
+    attempt = await _load_attempt_for_user(db, attempt_id_or_slug, user.id)
+    return await _session_view(db, attempt)
 
 
-@router.post(
-    "/exam-attempts/{attempt_id_or_slug}/answer",
-    response_model=AttemptOut,
-)
-async def submit_answer(
-    attempt_id_or_slug: str,
-    payload: AnswerIn,
-    user: CurrentUser,
-    db: DbSession,
-) -> AttemptOut:
-    attempt = await _load_attempt(db, attempt_id_or_slug, user.id)
-    if attempt.status != ExamStatus.IN_PROGRESS:
-        raise HTTPException(status_code=409, detail="Attempt no longer active")
+# ════════════════════════════════════════════════════════════════════════════
+# In-flight answer saving
+# ════════════════════════════════════════════════════════════════════════════
 
+
+async def _upsert_answer(
+    db, attempt: ExamAttempt, payload: AnswerIn
+) -> None:
     layout = next(
         (lay for lay in attempt.question_layout if lay["index"] == payload.question_index),
         None,
     )
     if not layout:
         raise HTTPException(status_code=400, detail="Invalid question index")
-
     existing = (
         await db.execute(
             select(ExamAnswer).where(
@@ -356,11 +546,11 @@ async def submit_answer(
             )
         )
     ).scalar_one_or_none()
-
     if existing:
         existing.answer = payload.answer
         existing.flagged = payload.flagged
-        existing.time_taken_ms = payload.time_taken_ms
+        if payload.time_taken_ms is not None:
+            existing.time_taken_ms = payload.time_taken_ms
     else:
         db.add(
             ExamAnswer(
@@ -372,62 +562,62 @@ async def submit_answer(
                 time_taken_ms=payload.time_taken_ms,
             )
         )
+
+
+@router.patch(
+    "/exam/sessions/{attempt_id_or_slug}/answer",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Save a single answer (frontend autosaves on every selection)",
+)
+async def save_answer(
+    attempt_id_or_slug: str,
+    payload: AnswerIn,
+    user: CurrentUser,
+    db: DbSession,
+) -> None:
+    attempt = await _load_attempt_for_user(db, attempt_id_or_slug, user.id)
+    if attempt.status != ExamStatus.IN_PROGRESS:
+        raise HTTPException(status_code=409, detail="Attempt no longer active")
+    await _upsert_answer(db, attempt, payload)
     await db.commit()
-    return await _attempt_to_out(db, attempt)
 
 
-@router.patch("/exam-attempts/{attempt_id_or_slug}/autosave", response_model=AttemptOut)
-async def autosave_answers(
+@router.patch(
+    "/exam/sessions/{attempt_id_or_slug}/autosave",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Bulk autosave (frontend calls every 30s)",
+)
+async def autosave(
     attempt_id_or_slug: str,
     payload: AutosaveIn,
     user: CurrentUser,
     db: DbSession,
-) -> AttemptOut:
-    attempt = await _load_attempt(db, attempt_id_or_slug, user.id)
+) -> None:
+    attempt = await _load_attempt_for_user(db, attempt_id_or_slug, user.id)
     if attempt.status != ExamStatus.IN_PROGRESS:
         raise HTTPException(status_code=409, detail="Attempt no longer active")
-
-    existing = (
-        await db.execute(select(ExamAnswer).where(ExamAnswer.attempt_id == attempt.id))
-    ).scalars().all()
-    existing_map = {a.question_index: a for a in existing}
-
-    layout_by_index = {lay["index"]: lay for lay in attempt.question_layout}
-
     for ans in payload.answers:
-        layout = layout_by_index.get(ans.question_index)
-        if not layout:
-            continue
-        if ans.question_index in existing_map:
-            row = existing_map[ans.question_index]
-            row.answer = ans.answer
-            row.flagged = ans.flagged
-            row.time_taken_ms = ans.time_taken_ms
-        else:
-            db.add(
-                ExamAnswer(
-                    attempt_id=attempt.id,
-                    question_id=uuid.UUID(layout["question_id"]),
-                    question_index=ans.question_index,
-                    answer=ans.answer,
-                    flagged=ans.flagged,
-                    time_taken_ms=ans.time_taken_ms,
-                )
-            )
+        await _upsert_answer(db, attempt, ans)
     await db.commit()
-    return await _attempt_to_out(db, attempt)
 
 
-# === Submit + grade ===
-async def _update_mastery_from_attempt(db, attempt: ExamAttempt, answers: list[ExamAnswer], questions: dict[uuid.UUID, Question]):
-    """Update MasteryTopic rows incrementally."""
+# ════════════════════════════════════════════════════════════════════════════
+# Submit + grade + result
+# ════════════════════════════════════════════════════════════════════════════
+
+
+async def _update_mastery_from_attempt(
+    db,
+    attempt: ExamAttempt,
+    answers: list[ExamAnswer],
+    questions: dict[uuid.UUID, Question],
+):
     by_topic: dict[uuid.UUID, list[tuple[ExamAnswer, Question]]] = {}
     for a in answers:
         q = questions.get(a.question_id)
         if not q:
             continue
         by_topic.setdefault(q.topic_id, []).append((a, q))
-
     for topic_id, pairs in by_topic.items():
         row = (
             await db.execute(
@@ -442,9 +632,13 @@ async def _update_mastery_from_attempt(db, attempt: ExamAttempt, answers: list[E
                 user_id=attempt.user_id,
                 topic_id=topic_id,
                 subject_id=attempt.subject_id,
+                attempts_count=0,
+                correct_count=0,
+                weighted_earned=Decimal("0.00"),
+                weighted_total=Decimal("0.00"),
+                mastery_pct=Decimal("0.00"),
             )
             db.add(row)
-
         for a, q in pairs:
             row.attempts_count += 1
             if a.is_correct:
@@ -456,37 +650,21 @@ async def _update_mastery_from_attempt(db, attempt: ExamAttempt, answers: list[E
                     str(float(row.weighted_earned) + weighted)
                 )
             row.last_attempted_at = _now()
-
         if float(row.weighted_total) > 0:
             pct = float(row.weighted_earned) / float(row.weighted_total) * 100.0
             row.mastery_pct = Decimal(f"{min(100.0, pct):.2f}")
 
 
-@router.post(
-    "/exam-attempts/{attempt_id_or_slug}/submit",
-    response_model=ResultOut,
-)
-async def submit_attempt(
-    attempt_id_or_slug: str, user: CurrentUser, db: DbSession
-) -> ResultOut:
-    attempt = await _load_attempt(db, attempt_id_or_slug, user.id)
-    if attempt.status not in (ExamStatus.IN_PROGRESS, ExamStatus.SUBMITTED):
-        raise HTTPException(status_code=409, detail="Attempt already graded or cancelled")
-
-    qids = [uuid.UUID(lay["question_id"]) for lay in attempt.question_layout]
-    questions = (
-        await db.execute(select(Question).where(Question.id.in_(qids)))
-    ).scalars().all()
-    qmap = {q.id: q for q in questions}
-
+async def _grade_attempt(
+    db, attempt: ExamAttempt
+) -> tuple[list[ExamAnswer], dict[uuid.UUID, Question]]:
+    qmap, _ = await _load_attempt_questions(db, attempt)
     answers = (
         await db.execute(select(ExamAnswer).where(ExamAnswer.attempt_id == attempt.id))
     ).scalars().all()
-
-    # Ensure rows exist for unanswered questions (mark wrong)
-    answered_indices = {a.question_index for a in answers}
+    answered_idx = {a.question_index for a in answers}
     for layout in attempt.question_layout:
-        if layout["index"] not in answered_indices:
+        if layout["index"] not in answered_idx:
             row = ExamAnswer(
                 attempt_id=attempt.id,
                 question_id=uuid.UUID(layout["question_id"]),
@@ -496,18 +674,17 @@ async def submit_attempt(
             db.add(row)
             answers.append(row)
 
-    # Grade each
     rasch_inputs: list[dict] = []
     for a in answers:
         q = qmap.get(a.question_id)
         if not q:
             continue
-        is_correct, points = grade_answer(q, a.answer)
-        a.is_correct = is_correct
-        a.points_awarded = points
+        ok, pts = grade_answer(q, a.answer)
+        a.is_correct = ok
+        a.points_awarded = pts
         rasch_inputs.append(
             {
-                "is_correct": is_correct,
+                "is_correct": ok,
                 "points": float(q.points),
                 "difficulty": float(q.difficulty),
             }
@@ -517,7 +694,6 @@ async def submit_attempt(
     g = grade_for_score(rasch)
     raw_score = float(sum(float(a.points_awarded) for a in answers))
 
-    # Topic breakdown
     topic_breakdown: dict[str, dict] = {}
     for a in answers:
         q = qmap.get(a.question_id)
@@ -533,7 +709,6 @@ async def submit_attempt(
         slot["pct"] = (
             round(slot["correct"] / slot["total"] * 100.0, 2) if slot["total"] else 0.0
         )
-
     weakest = sorted(
         (
             {"topic_id": tid, **slot}
@@ -541,7 +716,7 @@ async def submit_attempt(
             if slot["total"] >= 2
         ),
         key=lambda s: s["pct"],
-    )[:3]
+    )[:5]
 
     attempt.status = ExamStatus.GRADED
     attempt.submitted_at = _now()
@@ -554,49 +729,263 @@ async def submit_attempt(
 
     await _update_mastery_from_attempt(db, attempt, answers, qmap)
     await db.commit()
-
-    return ResultOut(
-        attempt_id=attempt.id,
-        slug=attempt.slug,
-        rasch_score=float(rasch),
-        raw_score=raw_score,
-        grade=g,
-        correct_count=sum(1 for a in answers if a.is_correct),
-        total_questions=len(answers),
-        topic_breakdown=topic_breakdown,
-        weakest_topics=weakest,
-        submitted_at=attempt.submitted_at,
-    )
+    return answers, qmap
 
 
-@router.get("/exam-attempts/{attempt_id_or_slug}/result", response_model=ResultOut)
+@router.post(
+    "/exam/sessions/{attempt_id_or_slug}/submit",
+    response_model=SubmitOut,
+    summary="Submit + grade. Returns a job ID for frontend's polling animation.",
+)
+async def submit_session(
+    attempt_id_or_slug: str, user: CurrentUser, db: DbSession
+) -> SubmitOut:
+    attempt = await _load_attempt_for_user(db, attempt_id_or_slug, user.id)
+    if attempt.status == ExamStatus.GRADED:
+        return SubmitOut(jobId=f"job-{attempt.id}", sessionId=str(attempt.id))
+    if attempt.status not in (ExamStatus.IN_PROGRESS, ExamStatus.SUBMITTED):
+        raise HTTPException(status_code=409, detail="Attempt already cancelled")
+    await _grade_attempt(db, attempt)
+    return SubmitOut(jobId=f"job-{attempt.id}", sessionId=str(attempt.id))
+
+
+@router.get(
+    "/exam/sessions/{attempt_id_or_slug}/result", response_model=ExamSummaryOut
+)
 async def get_result(
     attempt_id_or_slug: str, user: CurrentUser, db: DbSession
-) -> ResultOut:
-    attempt = await _load_attempt(db, attempt_id_or_slug, user.id)
+) -> ExamSummaryOut:
+    attempt = await _load_attempt_for_user(db, attempt_id_or_slug, user.id)
     if attempt.status != ExamStatus.GRADED:
-        raise HTTPException(status_code=409, detail="Attempt not yet graded")
+        # Auto-grade lazily so the polling loop just works even if /submit was missed.
+        if attempt.status == ExamStatus.IN_PROGRESS:
+            await _grade_attempt(db, attempt)
+        else:
+            raise HTTPException(status_code=409, detail="Attempt not yet graded")
+
+    qmap, tmap = await _load_attempt_questions(db, attempt)
+    subject = (
+        await db.execute(select(Subject).where(Subject.id == attempt.subject_id))
+    ).scalar_one_or_none()
+    subject_label = subject.name_en if subject else "Algebra"
     answers = (
-        await db.execute(select(ExamAnswer).where(ExamAnswer.attempt_id == attempt.id))
+        await db.execute(
+            select(ExamAnswer)
+            .where(ExamAnswer.attempt_id == attempt.id)
+            .order_by(ExamAnswer.question_index)
+        )
     ).scalars().all()
-    return ResultOut(
-        attempt_id=attempt.id,
-        slug=attempt.slug,
-        rasch_score=float(attempt.rasch_score or 0),
-        raw_score=float(attempt.raw_score or 0),
-        grade=attempt.grade.value if attempt.grade else "F",
-        correct_count=sum(1 for a in answers if a.is_correct),
-        total_questions=len(answers),
-        topic_breakdown=attempt.topic_breakdown,
-        weakest_topics=attempt.weakest_topics,
-        submitted_at=attempt.submitted_at or _now(),
+
+    section_a = SectionStats(correct=0, total=0, ball=0.0)
+    section_b = SectionStats(correct=0, total=0, ball=0.0)
+    breakdown: list[ExamBreakdownItem] = []
+    for a in answers:
+        q = qmap.get(a.question_id)
+        if not q:
+            continue
+        sect = _section_for_question(q)
+        if sect == "A":
+            section_a.total += 1
+            if a.is_correct:
+                section_a.correct += 1
+                section_a.ball += float(a.points_awarded)
+        else:
+            section_b.total += 1
+            if a.is_correct:
+                section_b.correct += 1
+                section_b.ball += float(a.points_awarded)
+        correct_str = q.correct_answer if isinstance(q.correct_answer, str) else (
+            ",".join(map(str, q.correct_answer)) if isinstance(q.correct_answer, list) else "?"
+        )
+        topic = tmap.get(q.topic_id)
+        breakdown.append(
+            ExamBreakdownItem(
+                qIndex=a.question_index,
+                topic=topic.name_en if topic else "",
+                yourAnswer=str(a.answer) if a.answer is not None else None,
+                correctAnswer=correct_str,
+                correct=bool(a.is_correct),
+                timeSpentMs=int(a.time_taken_ms or 0),
+            )
+        )
+
+    # Weak / strong topics from MasteryTopic
+    mastery_rows = (
+        await db.execute(
+            select(MasteryTopic).where(
+                MasteryTopic.user_id == attempt.user_id,
+                MasteryTopic.subject_id == attempt.subject_id,
+            )
+        )
+    ).scalars().all()
+    mastery_by_topic = {m.topic_id: float(m.mastery_pct) for m in mastery_rows}
+
+    weak_topics: list[TopicBreakdownOut] = []
+    for entry in attempt.weakest_topics or []:
+        tid = entry.get("topic_id")
+        try:
+            tuuid = uuid.UUID(tid) if tid else None
+        except ValueError:
+            tuuid = None
+        topic = tmap.get(tuuid) if tuuid else None
+        if not topic:
+            continue
+        mastery_pct = mastery_by_topic.get(topic.id, float(entry.get("pct", 0.0)))
+        # impact ~= weight × (1 − mastery)
+        impact = round(float(topic.weight) * (1.0 - mastery_pct / 100.0) * 8.0, 2)
+        weak_topics.append(
+            TopicBreakdownOut(
+                topic=topic.name_en,
+                domain=_domain_for(topic, fallback=subject_label),
+                mastery=round(mastery_pct, 1),
+                impact=impact,
+            )
+        )
+
+    # Strong topics: top-mastery rows with at least 2 attempts
+    strong_rows = sorted(
+        [m for m in mastery_rows if m.attempts_count >= 2],
+        key=lambda m: float(m.mastery_pct),
+        reverse=True,
+    )[:3]
+    strong_topics: list[StrongTopicOut] = []
+    for m in strong_rows:
+        topic = tmap.get(m.topic_id)
+        if not topic:
+            topic = (
+                await db.execute(select(Topic).where(Topic.id == m.topic_id))
+            ).scalar_one_or_none()
+            if not topic:
+                continue
+        strong_topics.append(
+            StrongTopicOut(
+                topic=topic.name_en,
+                domain=_domain_for(topic, fallback=subject_label),
+                mastery=round(float(m.mastery_pct), 1),
+            )
+        )
+
+    return ExamSummaryOut(
+        sessionId=str(attempt.id),
+        raschScore=round(float(attempt.rasch_score or 0), 1),
+        grade=attempt.grade.value if attempt.grade else "—",
+        totalCorrect=sum(1 for a in answers if a.is_correct),
+        totalQuestions=len(answers),
+        sectionA=section_a,
+        sectionB=section_b,
+        weakTopics=weak_topics,
+        strongTopics=strong_topics,
+        breakdown=breakdown,
+        certificateReady=(attempt.grade or Grade.FAIL) not in (Grade.FAIL,),
     )
 
 
-@router.get("/exams/me/recent", response_model=list[AttemptOut])
+# ════════════════════════════════════════════════════════════════════════════
+# Formula sheet + recent attempts
+# ════════════════════════════════════════════════════════════════════════════
+
+_MATH_FORMULAS: list[FormulaGroup] = [
+    FormulaGroup(
+        title="Algebra",
+        items=[
+            FormulaItem(name="Quadratic formula", eq="x = (−b ± √(b² − 4ac)) / 2a"),
+            FormulaItem(name="Discriminant", eq="D = b² − 4ac"),
+            FormulaItem(name="Vieta's theorem", eq="x₁ + x₂ = −b/a, x₁·x₂ = c/a"),
+            FormulaItem(name="Difference of squares", eq="a² − b² = (a − b)(a + b)"),
+            FormulaItem(name="Sum of cubes", eq="a³ + b³ = (a + b)(a² − ab + b²)"),
+            FormulaItem(name="Binomial square", eq="(a ± b)² = a² ± 2ab + b²"),
+        ],
+    ),
+    FormulaGroup(
+        title="Logarithms",
+        items=[
+            FormulaItem(name="Product", eq="logₐ(xy) = logₐ x + logₐ y"),
+            FormulaItem(name="Quotient", eq="logₐ(x/y) = logₐ x − logₐ y"),
+            FormulaItem(name="Power", eq="logₐ(xⁿ) = n·logₐ x"),
+            FormulaItem(name="Change of base", eq="logₐ x = ln x / ln a"),
+        ],
+    ),
+    FormulaGroup(
+        title="Trigonometry",
+        items=[
+            FormulaItem(name="Pythagorean identity", eq="sin²θ + cos²θ = 1"),
+            FormulaItem(name="Double angle (sin)", eq="sin 2θ = 2 sinθ cosθ"),
+            FormulaItem(name="Double angle (cos)", eq="cos 2θ = cos²θ − sin²θ"),
+            FormulaItem(name="Tangent", eq="tan θ = sin θ / cos θ"),
+            FormulaItem(name="Law of cosines", eq="c² = a² + b² − 2ab·cosγ"),
+        ],
+    ),
+    FormulaGroup(
+        title="Geometry",
+        items=[
+            FormulaItem(name="Circle area", eq="A = πr²"),
+            FormulaItem(name="Circle circumference", eq="C = 2πr"),
+            FormulaItem(name="Triangle area", eq="A = ½·b·h"),
+            FormulaItem(name="Sphere volume", eq="V = (4/3)πr³"),
+            FormulaItem(name="Cylinder volume", eq="V = πr²h"),
+        ],
+    ),
+    FormulaGroup(
+        title="Sequences & series",
+        items=[
+            FormulaItem(name="Arithmetic n-th term", eq="aₙ = a₁ + (n − 1)d"),
+            FormulaItem(name="Arithmetic sum", eq="Sₙ = n/2 · (a₁ + aₙ)"),
+            FormulaItem(name="Geometric n-th term", eq="aₙ = a₁ · qⁿ⁻¹"),
+            FormulaItem(name="Geometric sum", eq="Sₙ = a₁ · (qⁿ − 1) / (q − 1)"),
+        ],
+    ),
+]
+
+
+@router.get("/formulas", response_model=list[FormulaGroup])
+async def formulas(subject: str = "MATH") -> list[FormulaGroup]:
+    """Formula sheet. Currently only Math — other subjects return [] for now."""
+    if subject.upper() == "MATH":
+        return _MATH_FORMULAS
+    return []
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Legacy v1 endpoints — kept so anything already wired against them keeps working
+# ════════════════════════════════════════════════════════════════════════════
+
+
+class _LegacyStartIn(BaseModel):
+    subject_id: uuid.UUID | None = None
+    subject: str | None = None
+    target_grade: str | None = None
+    topic_id: uuid.UUID | None = None
+
+
+@router.post("/exams/full-mock", response_model=ExamSessionOut)
+async def legacy_full_mock(
+    payload: _LegacyStartIn, user: CurrentUser, db: DbSession
+) -> ExamSessionOut:
+    body = StartExamIn(
+        subject=payload.subject,
+        subject_id=payload.subject_id,
+        kind="full_mock",
+    )
+    return await create_session(body, user, db)
+
+
+@router.post("/exams/diagnostic", response_model=ExamSessionOut)
+async def legacy_diagnostic(
+    payload: _LegacyStartIn, user: CurrentUser, db: DbSession
+) -> ExamSessionOut:
+    body = StartExamIn(
+        subject=payload.subject,
+        subject_id=payload.subject_id,
+        kind="diagnostic",
+        target_grade=payload.target_grade,
+    )
+    return await create_session(body, user, db)
+
+
+@router.get("/exams/me/recent", response_model=list[ExamSessionOut])
 async def list_my_attempts(
     user: CurrentUser, db: DbSession, limit: int = 20
-) -> list[AttemptOut]:
+) -> list[ExamSessionOut]:
     attempts = (
         await db.execute(
             select(ExamAttempt)
@@ -605,9 +994,88 @@ async def list_my_attempts(
             .limit(limit)
         )
     ).scalars().all()
-    return [await _attempt_to_out(db, a) for a in attempts]
+    return [await _session_view(db, a) for a in attempts]
+
+
+class ExamHistoryItemOut(_CamelModel):
+    """Compact summary of an exam attempt for history lists (roadmap, mocks page)."""
+
+    id: str
+    slug: str
+    subject: str
+    subject_label: str = Field(alias="subjectLabel")
+    kind: str
+    status: str
+    grade: str | None
+    rasch_score: float | None = Field(alias="raschScore")
+    raw_score: float | None = Field(alias="rawScore")
+    total_correct: int = Field(alias="totalCorrect")
+    total_questions: int = Field(alias="totalQuestions")
+    started_at: int = Field(alias="startedAt")
+    submitted_at: int | None = Field(alias="submittedAt")
+
+
+@router.get("/exam/history", response_model=list[ExamHistoryItemOut])
+async def exam_history(
+    user: CurrentUser, db: DbSession, limit: int = 20
+) -> list[ExamHistoryItemOut]:
+    """Recent exam attempts with their scores — backs the mock-history UI on the
+    ExamLanding and Roadmap pages so users can see how they did after submitting."""
+    attempts = (
+        await db.execute(
+            select(ExamAttempt)
+            .where(ExamAttempt.user_id == user.id)
+            .order_by(desc(ExamAttempt.started_at))
+            .limit(limit)
+        )
+    ).scalars().all()
+    if not attempts:
+        return []
+
+    subject_ids = {a.subject_id for a in attempts}
+    subjects = (
+        await db.execute(select(Subject).where(Subject.id.in_(subject_ids)))
+    ).scalars().all()
+    subj_by_id = {s.id: s for s in subjects}
+
+    out: list[ExamHistoryItemOut] = []
+    for a in attempts:
+        subj = subj_by_id.get(a.subject_id)
+        answers = (
+            await db.execute(
+                select(ExamAnswer).where(ExamAnswer.attempt_id == a.id)
+            )
+        ).scalars().all()
+        total_correct = sum(1 for ans in answers if ans.is_correct)
+        total_q = len(a.question_layout or [])
+        out.append(
+            ExamHistoryItemOut(
+                id=str(a.id),
+                slug=a.slug,
+                subject=subj.code.value if subj else "MATH",
+                subjectLabel=subj.name_en if subj else "Mathematics",
+                kind=a.kind.value,
+                status=a.status.value,
+                grade=a.grade.value if a.grade else None,
+                raschScore=float(a.rasch_score) if a.rasch_score is not None else None,
+                rawScore=float(a.raw_score) if a.raw_score is not None else None,
+                totalCorrect=total_correct,
+                totalQuestions=total_q,
+                startedAt=_ms(a.started_at),
+                submittedAt=_ms(a.submitted_at) if a.submitted_at else None,
+            )
+        )
+    return out
 
 
 @router.get("/exams/health", include_in_schema=False)
 async def _module_health() -> dict:
     return {"module": "exams", "status": "ok"}
+
+
+# Module-level re-exports used by the regex parser when projecting answers.
+__all__ = [
+    "router",
+    "ExamSessionOut",
+    "ExamSummaryOut",
+]

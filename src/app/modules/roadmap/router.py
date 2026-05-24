@@ -7,12 +7,20 @@ from datetime import datetime
 
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import desc, select
 
 from app.core.deps import CurrentUser, DbSession
 from app.models.catalog import Question, Subject, Topic
+from app.models.exam import ExamAttempt, ExamStatus
 from app.models.progress import MasteryTopic, Roadmap
-from app.modules.roadmap.generator import generate_milestones, generated_at_utc
+from app.modules.roadmap.generator import (
+    enrich_with_gemini,
+    generate_milestones,
+    generated_at_utc,
+)
+
+# Number of most-recent graded mocks fed into the Gemini prompt as context.
+RECENT_MOCK_LIMIT = 3
 
 router = APIRouter(prefix="/api/v1", tags=["roadmap"])
 
@@ -81,7 +89,33 @@ async def _build_roadmap(db, user_id: uuid.UUID, subject: Subject, exam_date) ->
             )
         )
     ).scalars().all()
+    # Pull the most recent graded mocks so the prompt can reflect them.
+    # Newest first; Gemini reads them in that order.
+    recent_mocks = (
+        await db.execute(
+            select(ExamAttempt)
+            .where(
+                ExamAttempt.user_id == user_id,
+                ExamAttempt.subject_id == subject.id,
+                ExamAttempt.status == ExamStatus.GRADED,
+            )
+            .order_by(desc(ExamAttempt.submitted_at))
+            .limit(RECENT_MOCK_LIMIT)
+        )
+    ).scalars().all()
+    # Topic-id → name lookup so the prompt can name weak topics from the
+    # mock breakdowns instead of dumping raw UUIDs.
+    topic_names = {t.id: t.name_en for t in topics}
     milestones = generate_milestones(topics, mastery, exam_date=exam_date)
+    # Best-effort Gemini re-ordering. Output shape is identical — only the
+    # `order` and `week_bucket` of each milestone may shift.
+    milestones = await enrich_with_gemini(
+        milestones,
+        subject,
+        exam_date=exam_date,
+        recent_mocks=list(recent_mocks),
+        topic_names=topic_names,
+    )
 
     existing = (
         await db.execute(

@@ -9,7 +9,7 @@ from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.db import Base
-from app.models.base import TimestampMixin
+from app.models.base import TimestampMixin, pg_enum
 
 
 class LeaderboardScope(str, enum.Enum):
@@ -49,7 +49,7 @@ class LeaderboardEntry(Base, TimestampMixin):
 
     id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     scope: Mapped[LeaderboardScope] = mapped_column(
-        Enum(LeaderboardScope, name="leaderboard_scope"), nullable=False
+        pg_enum(LeaderboardScope, name="leaderboard_scope"), nullable=False
     )
     subject_id: Mapped[uuid.UUID] = mapped_column(
         PGUUID(as_uuid=True), ForeignKey("subjects.id", ondelete="CASCADE"), nullable=False

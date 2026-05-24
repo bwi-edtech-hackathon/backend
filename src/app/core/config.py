@@ -40,7 +40,7 @@ class Settings(BaseSettings):
 
     # === Gemini ===
     gemini_api_key: str | None = None
-    gemini_model: str = "gemini-2.0-flash-exp"
+    gemini_model: str = "gemini-2.5-flash"
 
     # === Battle ===
     battle_rate_limit_per_day: int = 30

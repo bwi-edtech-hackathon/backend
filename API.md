@@ -7,8 +7,19 @@ Profile) and the FastAPI backend.
 - **Base URL (dev):** `http://localhost:8000`
 - **API prefix:** `/api/v1`
 - **Real-time:** WebSocket at `/ws/battles/{battle_id}`, Server-Sent Events at `/api/v1/chat-lesson/sessions/{id}/messages`
-- **Auth:** Bearer JWT in `Authorization` header. Refresh via rotation.
+- **Auth:** Bearer JWT in `Authorization` header. In demo mode the header is **optional** — requests without a token resolve to a shared demo user that is auto-created on first hit.
 - **OpenAPI:** auto-generated at `/docs` (Swagger) and `/redoc`.
+
+> 🆕 **Frontend-shaped layer.** Three React-friendly route prefixes return
+> camelCase JSON with string subject codes (no UUID lookup required):
+>
+> - `POST /api/v1/exam/sessions` · `GET /api/v1/exam/sessions/{id}` · `PATCH …/answer` · `PATCH …/autosave` · `POST …/submit` · `GET …/result`
+> - `POST /api/v1/battles/sessions` · `GET …/{id}` · `POST …/{id}/answer` · `GET …/{id}/result` · `GET /sessions/history` · `GET /sessions/live`
+> - `GET /api/coach/sessions` · `POST /api/coach/sessions` (`{topic}`) · `POST /api/coach/sessions/{id}/messages` (non-streaming) · `POST …/end` · `POST …/understood`
+> - `GET /api/v1/formulas?subject=MATH` (formula sheet for the exam tool)
+>
+> The original v1 endpoints are unchanged; the new layer wraps the same DB-backed
+> grading, ELO, mastery, and chat-history logic.
 
 ---
 
