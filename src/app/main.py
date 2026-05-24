@@ -53,13 +53,19 @@ app = FastAPI(
 )
 
 # === Middleware ===
+# Note: "*" is incompatible with allow_credentials=True per the CORS spec, so we
+# translate wildcard mode into a regex match that echoes the request origin.
+_cors_origins = settings.cors_origins_list
+_cors_kwargs: dict = (
+    {"allow_origin_regex": ".*"} if _cors_origins == ["*"] else {"allow_origins": _cors_origins}
+)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origins_list,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["X-Request-Id"],
+    **_cors_kwargs,
 )
 
 # === Exception handlers ===
